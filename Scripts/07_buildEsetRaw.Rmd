@@ -1,0 +1,595 @@
+---
+title: "iPSC Cardiomyocyte Characterization"
+author: "Manonmani Kumar"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  rmdformats::html_clean:
+    highlight: kate
+    toc_depth: 1
+    gallery: true
+---
+
+
+```{r knitr_init, echo=FALSE, cache=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="95")
+opts_chunk$set(echo=FALSE,
+               cache=FALSE,
+               prompt=FALSE,
+               tidy=FALSE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE,
+               fig.retina = 2,
+               pngquant = '--speed=1 --nofs')
+opts_knit$set(width=95)
+
+## IMG optimization
+#knit_hooks$set(pngquant = hook_pngquant)
+```
+
+```{r LoadLibraries}
+# Always Load these libraries (Adjust for the final script)
+# CRAN
+library(assertthat)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(gdata)
+library(ggplot2)
+library(grid)
+
+# Bioconductor
+library(Biobase)
+library(limma)
+library(impute)
+
+# Optional
+
+library(knitr)
+library(RColorBrewer)
+library(gridExtra)
+library(flashClust)
+library(ggdendro)
+library(ggrepel)
+
+# Set Random Seed for
+base::set.seed(42) # Because 42 is the answer to everything in a random universe.
+```
+
+```{r write_functions, results='hide'}
+
+readInCounts <- function(fileList = NULL, 
+                         header = TRUE, 
+                         platform = NULL, 
+                         key = 'Illumicode',
+                         length = F) 
+{
+  require(impute)
+  columnNames <- list()
+  
+  if (platform == 'illuminaBeadTypeFile') {
+    
+    # todo: add function validate parameters that verifies files, key
+    
+    # This is the exported data from the iScan instruments
+    
+    columnNames[['key']]         <- key    # Name of column of probeIDs
+    columnNames[['numBeads']]    <- 'N'    # Number of beads used for calculation
+    columnNames[['dev']]         <- 'Dev'  # Deviation as calculated by Illumina software
+    
+    # Start with first file in the directory
+    # Extract the sample names from the filenames.
+    # <sampleName>_beadTypeFile.txt
+    columnNames[['sampleName']] <- unlist(strsplit(x = basename(fileList[1]),
+                                                   split = "_beadTypeFile.txt", perl = TRUE)[1])   
+    
+    # Read in the first file and set the sample name
+    currentFile           <- read.csv(file = fileList[1], header = TRUE, sep = ',' )
+    colnames(currentFile) <- c(columnNames$key,columnNames$numBeads, columnNames$sampleName, columnNames$dev)
+    currentFile           <- currentFile[, unlist(c(columnNames$key, columnNames$sampleName)) ]
+    
+    for (i in 2:length(fileList)) {
+      
+      # Read in the ith file and set the column names
+      nextFile                     <- read.csv(file = fileList[i], header = TRUE, sep = ',' )
+      columnNames[['sampleName']]  <- unlist(strsplit(x = basename(fileList[i]),
+                                                      split = "_beadTypeFile.txt", perl = TRUE)[1])   
+      colnames(nextFile) <- c(columnNames$key,columnNames$numBeads, columnNames$sampleName, columnNames$dev)
+      nextFile           <- nextFile[, unlist(c(columnNames$key, columnNames$sampleName)) ]
+      currentFile        <- base::merge(x = currentFile, 
+                                        y = nextFile, 
+                                        by = columnNames$key) 
+      
+    }
+      
+  
+    rownames(currentFile)  <- currentFile[,1]
+    currentFile            <- currentFile[,-1]
+  
+    if (any(is.na(as.matrix(currentFile)))) {
+      exprs_impute <- suppressMessages(impute::impute.knn(data = as.matrix(currentFile)))
+      currentFile <- exprs_impute$data
+    }
+    as.matrix(currentFile)
+    
+  } else if (platform == 'illuminaStarCounts') {
+    
+    countMat   <-   lapply(fileList, FUN = function(file)
+    {
+      return(value = read.table(file      =   file,
+                                sep       =   "\t",
+                                col.names =   c("id", "value", "sense", "antisense")))
+    })
+
+    #  Verify that all the files have the same transcript ids
+
+    id   <-  countMat[[1]][, "id"]
+    flag <- sapply(countMat,FUN = function(file)
+    {
+      return(value = all(id == file[, "id"]))
+    })
+    if (any(!flag))
+    {
+      print("warning some tag id missing in some of the count files")        
+    }
+
+
+    #  Merge all the count files
+
+    countMat <- sapply(countMat, FUN = function(file) {
+      file[, "value"]
+    })
+    #  Remove first five lines
+    id <- id[-(1:4)]
+    countMat <- countMat[-(1:4),]
+
+
+
+    rownames(countMat) <- id
+    colnames(countMat) <- gsub(pattern      =   ".starReadsPerGene.out.tab",
+                               replacement  =   "",
+                               basename(fileList))
+    as.matrix(countMat)
+
+  } else if (platform == 'htseq-count') {
+    
+    countMat   <-   lapply(fileList, FUN = function(file)
+    {
+      return(value = read.table(file      =   file,
+                                sep       =   "\t",
+                                col.names =   c("id", "value"),
+                                stringsAsFactors = F))
+    })
+
+    #  Verify that all the files have the same transcript ids
+
+    id   <-  countMat[[1]][, "id"]
+    flag <- sapply(countMat,FUN = function(file)
+    {
+      return(value = all(id == file[, "id"]))
+    })
+    if (any(!flag))
+    {
+      print("warning some tag id missing in some of the count files")        
+    }
+
+
+    #  Merge all the count files
+
+    countMat <- sapply(countMat, FUN = function(file) {
+      file[, "value"]
+    })
+    #  Remove the last five lines
+    id <- head(id, -5)
+    countMat <- head(countMat, -5)
+
+
+
+    rownames(countMat) <- id
+    colnames(countMat) <- gsub(pattern      =   "_gene_id.counts",
+                               replacement  =   "",
+                               basename(fileList))
+    as.matrix(countMat)
+
+  } else if (platform == 'featureCounts') {
+    
+    countMat   <-   lapply(fileList, FUN = function(file)
+    {
+      return(value = read.table(file      =   file,
+                                sep       =   "\t",
+                                col.names =   c("id",  "Chr", "Start", "End", "Strand", "Length", "Counts"),
+                                stringsAsFactors = F,
+                                skip = 2)[,c(1,6,7)])
+    })
+
+    #  Verify that all the files have the same transcript ids
+
+    id   <-  countMat[[1]][, "id"]
+    flag <- sapply(countMat,FUN = function(file)
+    {
+      return(value = all(id == file[, "id"]))
+    })
+    if (any(!flag))
+    {
+      print("warning some tag id missing in some of the count files")        
+    }
+
+
+    #  Merge all the count files
+
+    countMatCounts <- sapply(countMat, FUN = function(file) {
+      file[, "Counts"]
+    })
+    
+
+
+    rownames(countMatCounts) <- id
+    colnames(countMatCounts) <- gsub(pattern      =   "_gene_id.counts|_gene_name.counts",
+                               replacement  =   "",
+                               basename(fileList))
+    
+    if (length) {
+      lengthMat <- sapply(countMat, FUN = function(file) {
+        file[, "Length"]
+      })
+      
+      rownames(lengthMat) <- id
+      colnames(lengthMat) <- gsub(pattern      =   "_gene_id.counts|_gene_name.counts",
+                               replacement  =   "",
+                               basename(fileList))
+      
+      list("counts" = as.matrix(countMatCounts), "lengths" = as.matrix(lengthMat))
+    } else {
+      as.matrix(countMatCounts)
+    }
+  }
+}
+
+readInPhenoData <-  function (pathToFile = NULL, fileType = 'csv', row.names = 'hybeID') {
+
+  df_pDataRaw    <- read.csv(file = pathToFile,header = TRUE, stringsAsFactors = FALSE)
+
+
+
+  # Set the row names to the hybeID column
+  rownames(df_pDataRaw) <- df_pDataRaw[[row.names]]
+
+  # remove the factors class from the rows
+  #df_pDataRaw[] <- lapply(df_pDataRaw, as.character)
+  df_pDataRaw
+}
+
+readInFeatureData <- function (pathToFile = NULL, mat_exprs = NULL ) {
+  df_ilmn_ht12v4 <- read.csv(file = parameters$pathToFeatureData, header = TRUE)
+
+  rownames(df_ilmn_ht12v4) <- df_ilmn_ht12v4$ILMN_HT2v4
+  df_ilmn_ht12v4 <- df_ilmn_ht12v4[-1]
+  df_fData <- subset(df_ilmn_ht12v4,
+                     df_ilmn_ht12v4$arrayAddressID %in% rownames(mat_exprs))
+  df_fData
+}
+
+plotMultipleDensities <- function(exprs_mat, ncol=3) {
+  # Determine Groups
+  array_sort <- names(sort(rowMeans(t(exprs_mat), na.rm=T), decreasing = T))
+  num_groups <- length(array_sort) %/% 12
+  extra <- length(array_sort) %% 12
+  
+  # Check if there are more columns than needed
+  if (dim(exprs_mat)[2] < ncol*12) {
+    ncol <- num_groups
+    if (extra != 0) ncol <- ncol + 1
+  }
+
+  if (extra == 0) {
+    groups <- data.frame(array_sort, group=rep(1:num_groups, 12))
+  } else {
+    groups <- data.frame(array_sort, group=c(rep(1:(num_groups + 1), extra), if(num_groups != 0) rep(1:num_groups, 12 - extra)))
+    num_groups <- num_groups + 1
+  }
+  
+  # Create plots
+  plots <- lapply(1:num_groups, function(x){
+    exprs_melt <- melt(exprs_mat[,groups[groups$group == x, 1], drop = F], na.rm=T)
+    plot <- ggplot(exprs_melt, aes(value)) + stat_density(adjust = 1, geom = "path", position="identity", na.rm=TRUE, trim=TRUE, aes(color=factor(Var2))) + scale_color_manual(values=brewer.pal(12, "Paired")) + theme(title=element_blank(), axis.title=element_blank())
+    return(plot)
+  })
+  
+  do.call(arrangeGrob, c(plots, ncol=ncol, left="Density", bottom="Values"))
+}
+
+# Based on code from http://michaeljw.com/blog/post/subchunkify/
+
+#' Generate a sub-chunk to be interpreted by knitr.  The enclosing chunk
+#' must have "results='asis'"
+#'
+#' @param g The output to chunkify (only tested with figures to date)
+#' @param ... Additional named arguments to the chunk
+#' @return NULL
+#' @details The chunk is automatically output to the console.  There is
+#'   no need to print/cat its result.
+#' @export
+subchunkify <- local({
+  chunk_count <- 0
+  function(g, ...) {
+    chunk_count <<- chunk_count + 1
+    g_deparsed <-
+      paste0(deparse(
+        function() {g}
+      ),
+      collapse = '')
+    args <- list(...)
+    args <-
+      lapply(names(args),
+             FUN=function(nm, arglist) {
+               current <- arglist[[nm]]
+               if (length(current) > 1) {
+                 stop("Only scalars are supported by subchunkify")
+               } else if (is.character(current) | is.factor(current)) {
+                 current <- as.character(current)
+                 ret <- paste0('"', gsub('"', '\"', current, fixed=TRUE), '"')
+               } else if (is.numeric(current) | is.logical(current)) {
+                 ret <- as.character(current)
+               } else {
+                 stop("Unhandled class in subchunkify argument handling")
+               }
+               paste0(nm, "=", ret)
+             },
+             arglist=args)
+    args <- paste0(unlist(args), collapse=", ")
+    chunk_header <-
+      paste(
+        paste0("{r sub_chunk_", chunk_count),
+        if (nchar(args) > 0) {
+          paste(",", args)
+        } else {
+          NULL
+        },
+        ", echo=FALSE}")
+    
+    sub_chunk <- paste0(
+      "\n```",chunk_header, "\n",
+      "(", 
+      g_deparsed
+      , ")()\n",
+      "```\n")
+    cat(knitr::knit(text = knitr::knit_expand(text = sub_chunk), quiet = TRUE))
+  }
+})
+
+
+```
+
+```{r init, eval=FALSE}
+# Initialize the project
+
+parameters <- list() 
+
+# Setup the path to the count files here
+parameters$listOfFileCounts   <- list.files(path = "./counts", pattern = "*_genecounts", full.names=T)
+
+# Setup the path to the gtf file here
+parameters$pathToFeatureData  <- as.character("~/GTF/NCBI/Human/genes.gtf")
+```
+
+```{r readinParts, eval=FALSE}
+library(openxlsx)
+
+rawDir 		  <- "counts"
+dataDir <- "data"
+# Read in counts
+#lst_mat <- readInCounts(fileList = parameters$listOfFileCounts, platform="featureCounts", length = T)
+#mat_counts <- lst_mat$counts
+
+#  Read counts files
+fileLS     <-   list.files(path =   rawDir, pattern    =   "genecounts$",
+                full.names =   TRUE, recursive  =   TRUE)
+
+fileLS <- c(fileLS)
+
+countMat   <-   lapply(fileLS, FUN = function(file)
+{
+  return(value = read.table(file =  file,sep       =  "\t",
+                      col.names =  c("id", "value")))})
+
+#  Verify that all the files have the same transcript ids
+    id   <-  countMat[[1]][, "id"]
+    flag <- sapply(countMat,FUN = function(file)
+   {
+    return(value = all(id == file[, "id"]))})
+    if (any(!flag))
+    {
+    print("warning some tag id missing in some of the count files")        
+   }
+
+
+#  Merge all the count files
+    countMat <- sapply(countMat, FUN = function(file) {
+    							   	   		file[, "value"]})
+    										rownames(countMat) <- id
+   									    colnames(countMat) <- gsub(pattern      =   "_genecounts",
+                               															replacement  =   "",
+                              	 														basename(fileLS))
+
+mat_counts     <-  as.data.frame(countMat)
+#   Write the count matrix
+    #write.xlsx(countDF,
+    #            	  file = file.path(dataDir, "expCounts.xlsx"),
+    #            	   sep  = "\t")
+    #countDF     <-  as.data.frame(countMat)
+    #cat("done\n")
+
+# Sample Annotation1 creation for this project
+
+sample.worksheet <- openxlsx::read.xlsx("./data/Library10_sampleannotation.xlsx", sheet = 1) %>% as.data.frame()
+
+# sample.worksheet[sample.worksheet == "N/A"] <- NA
+# 
+# sample.worksheet <- sample.worksheet[sample.worksheet$Sample_name %in% colnames(mat_counts), ]
+# 
+# sample.worksheet <- sample.worksheet[!duplicated(sample.worksheet$Sample_name), ] # remove duplicated data
+# rownames(sample.worksheet) <- sample.worksheet$Sample_ID #rename row index with case.id label
+
+rownames(sample.worksheet) <- sample.worksheet$Sample_ID
+sample.worksheet <- sample.worksheet[-c(41,48),]
+colnames(mat_counts) <- rownames(sample.worksheet)
+
+sample.worksheet$group <- sample.worksheet$Vendor
+sample.worksheet$donor <- sample.worksheet$Group
+
+mat_counts <- mat_counts[ , order(names(mat_counts))]
+sample.worksheet <- sample.worksheet[order(rownames(sample.worksheet)), ]
+
+# Sanity check to ensure all samples are matched
+assertthat::are_equal(rownames(sample.worksheet),colnames(mat_counts))
+rownames(sample.worksheet) <- colnames(mat_counts)
+
+rownames(mat_counts) <- gsub("\\.[0-9]+","",rownames(mat_counts))
+
+df_pData <- sample.worksheet
+
+# Remove any columns that are mostly empty, or do not add any information
+#df_pData <- df_pData[, apply(df_pData, 2, function(x) {length(unique(x))}) > 2]
+
+```
+
+```{r fData, eval=FALSE}
+
+# Load featuredata from the GTF annotation used during counting, this can change depending on GTF
+
+cNames <- c("seqname",
+             "source",
+             "feature",
+             "start",
+             "end",
+             "score",
+             "strand",
+             "frame",
+             "attributes")
+
+df_fData      <-  read.table(file          = parameters$pathToFeatureData,
+                                           sep       = "\t",
+                                           col.names = cNames)        
+
+df_fData$"gene_id"    <-  gsub(pattern     = ".*gene_id ([^;]*);.*",
+                                         replacement = "\\1",
+                                         df_fData$"attributes")
+
+df_fData$"gene_id1" <- gsub(pattern     = ".*gene_id ([^.]*).*",
+     replacement = "\\1",
+     df_fData$"attributes")
+
+df_fData$"gene_name"  <-  gsub(pattern     =   ".*gene_name ([^;]*);.*",
+                                         replacement =   "\\1",
+                                         df_fData$"attributes")
+
+# One feature per gene
+df_fData <- df_fData[!duplicated(df_fData$gene_name),]
+
+rownames(df_fData) <- df_fData$gene_id1
+
+# matrix_gene<- gsub("\\.[0-9]+","",rownames(mat_counts))
+# rownames(mat_counts) <- matrix_gene
+# mat_counts <- mat_counts[order(rownames(mat_counts)),]
+# 
+# fdata_gene<- gsub("\\.[0-9]+","",rownames(df_fData))
+# rownames(df_fData) <- fdata_gene
+# df_fData <- df_fData[order(rownames(df_fData)), ]
+
+gene_name <- intersect(rownames(mat_counts), rownames(df_fData))
+mat_counts <- mat_counts[gene_name, ]
+df_fData <- df_fData[gene_name,]
+
+rownames(df_fData) <- df_fData$gene_name
+rownames(mat_counts) <- rownames(df_fData)
+
+assertthat::are_equal(rownames(df_fData),rownames(mat_counts))
+
+# rownames(df_fData) <- df_fData$gene_name
+# rownames(mat_counts) <- rownames(df_fData)
+# 
+# assertthat::are_equal(rownames(df_fData),rownames(mat_counts))
+
+```
+
+```{r createEset, results='hide'}
+
+# Generate Eset, comment this out after final RDS is saved and load pre-built one on subsequent runs.
+
+eset_raw <- ExpressionSet(assayData   = as.matrix(mat_counts),
+                                                  phenoData   = new("AnnotatedDataFrame",data = df_pData),
+                                                  featureData = new("AnnotatedDataFrame", data = df_fData),
+                                                  annotation  = "Human")
+
+```
+
+```{r buildProject, eval=FALSE }
+# Build and save project tree
+# Use FeatureCounts as default
+
+AAA_PROJECT <- list()
+
+AAA_PROJECT$Esets$eset_raw   <- eset_raw
+#AAA_PROJECT$Esets$gene_lengths <- lst_mat$lengths
+AAA_PROJECT$savePath          <- file.path("eset_raw")
+
+```
+
+```{r saveProjectTree, strip.white=TRUE, cache=FALSE, echo=FALSE, eval=FALSE}
+
+# Create the parameter values
+currentTime <- paste(format(Sys.time(), "%Y-%m-%dt%H_%M_%S"))
+
+
+# Save the analysis
+AAA_PROJECT$savePath <- paste0(AAA_PROJECT$savePath ,paste0(currentTime,".RDS"))
+saveRDS(AAA_PROJECT,file = AAA_PROJECT$savePath)
+
+   
+rm(currentTime)
+```
+
+```{r create rpkm, eval = F}
+# In case rpkm values are desired
+
+library(edgeR)
+
+eset_raw <- readRDS("eset_raw2022-03-03t12_19_01.RDS")
+
+eset_raw <- eset_raw$Esets$eset_raw
+
+fullDge       <-  DGEList(counts       =   exprs(eset_raw),
+                            remove.zeros =   TRUE)
+fullDge <-  calcNormFactors(object = fullDge, method = "TMM")
+topExprs <- rpkm(fullDge, gene.length = eset_raw$Esets$gene_lengths[rownames(fullDge),1], normalized.lib.sizes = T)
+
+# Filter unknown transcripts out
+#topExprs <- topExprs[!grepl("^LOC", rownames(topExprs)), ]
+#topExprs <- topExprs[!grepl("^LINC", rownames(topExprs)), ]
+#topExprs <- topExprs[!grepl("orf", rownames(topExprs)), ]
+
+write.csv(topExprs, "rpkm_counts.csv")
+
+```
+
+```{r create cpm, eval = F}
+# In case cpm values are desired
+
+
+fullDge       <-  DGEList(counts       =   exprs(eset_raw),
+                            remove.zeros =   TRUE)
+fullDge <-  calcNormFactors(object = fullDge, method = "TMM")
+topExprs <- cpm(fullDge, prior.count = 0.25, log=T)
+
+
+topExprs <- topExprs[!grepl("^LOC", rownames(topExprs)), ]
+topExprs <- topExprs[!grepl("^LINC", rownames(topExprs)), ]
+topExprs <- topExprs[!grepl("orf", rownames(topExprs)), ]
+
+write.csv(topExprs, "cpm_counts.csv")
+
+```

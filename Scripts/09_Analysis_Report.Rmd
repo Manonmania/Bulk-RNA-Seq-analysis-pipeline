@@ -1,0 +1,993 @@
+---
+title: "iPSC Cardiomyocyte Characterization (Axol and CDI)"
+author: ""
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  rmdformats::html_clean:
+    highlight: kate
+    toc_depth: 1
+    self_contained: true
+    gallery: true
+---
+
+```{r knitr_init, echo=FALSE, cache=FALSE}
+library(knitr)
+library(rmdformats)
+library(svglite)
+
+optisvg = function(before, options, envir) {
+  if (before) return()
+  if (!file.exists(fig_path("svg")[1])) return()
+  for (f in fig_path("svg")) {
+   system2('svgo', shQuote(f))
+  }
+}
+
+optipng = function(before, options, envir) {
+  if (before) return()
+  if (!file.exists(fig_path("png")[1])) return()
+  for (f in fig_path("png")) {
+   system2('mogrify', c('-trim', '-bordercolor white', '-border 10', shQuote(f)))
+   system2('pngquant', c('--speed 10', '--nofs', '-f', '--ext .png', shQuote(f)))
+  }
+}
+
+## Global options
+options(max.print="95")
+opts_chunk$set(echo=FALSE,
+               cache=FALSE,
+               prompt=FALSE,
+               tidy=FALSE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE,
+               fig.retina = 1,
+               #dpi = 72,
+               dev = 'svg',
+               opt.svg = TRUE)
+               #opt.png = TRUE)
+opts_knit$set(width=95)
+
+## IMG optimization
+knit_hooks$set(opt.svg = optisvg)
+#knit_hooks$set(opt.png = optipng)
+```
+
+```{r LoadLibraries, results='hide'}
+# Always Load these libraries
+# CRAN
+library(assertthat)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(openxlsx)
+library(DT)
+library(pheatmap)
+
+# Bioconductor
+library(Biobase)
+library(impute)
+library(edgeR)
+library(limma)
+suppressMessages(library(GSVA))
+library(genefilter)
+library(ggplot2)
+
+
+# Optional
+
+library(knitr)
+library(VennDiagram)
+flog.threshold(ERROR)
+library(RColorBrewer)
+library(randomcoloR)
+
+# Set Random Seed for
+base::set.seed(42) # Because 42 is the answer to everything in a random universe.
+```
+
+```{r functions, results='hide'}
+
+mapGmt2NamedList <- function(gmtFileName=NULL, type='simple') {
+  # This function  takes in a GMT file and creates a named list
+  if(type == 'Rlist') {
+    fieldStart = 2
+  }else if(type == 'simple') {
+    # means name\tgene1\tgene2\t...
+    # if default type is simple set to 2
+    fieldStart = 2
+  } else if (type == 'broad'){
+    # name\tURL\t\gene1\t\gene2\
+    # if the default type is broad, set to 3
+    fieldStart = 3
+  } else {
+    # if there default is missing
+    # Same as broad but 2nd position is not necessarily URL
+    fieldStart = 3
+  }
+  geneSet <- list()
+  if (type=='Rlist') {
+    load(file = gmtFileName,verbose = FALSE)
+    gmtFile <- gmt
+    rm(gmt)
+    for (entry in gmtFile) {
+      geneSet[[unlist(entry[1])[1]]] <- entry[fieldStart:length(entry)]
+    }
+  } else {
+    geneSet <- list()
+    gmtFile <- readLines(con=gmtFileName)
+    gmtFile <- strsplit(gmtFile, '\t')
+    
+    for (entry in gmtFile) {
+      entry <- unlist(entry)
+      geneSet[[unlist(entry[1])[1]]] <- entry[fieldStart:length(entry)]
+    }
+  }
+  
+  rm(gmtFile,entry, gmtFileName,type)
+  
+  geneSet
+}
+
+
+
+gradient.hm <- function(genes=geneSet,
+                        AssocData=toptable,
+                        PathwayData=NULL,
+                        Estimate='logFC',
+                        const=F,
+                        max=NULL,
+                        numGenes=50,
+                        orderBy="consensus",
+                        annotate_col_labels=NULL,
+                        annotate_row_labels=NULL,
+                        main="Checkerboard",
+                        silent=F){
+  
+  ## Get unique gene symbols from all pathways
+  unique.genes <- na.omit(unique(do.call(c, genes)))
+  
+  ## Create matrix.  One row for each pathway.  One column for each
+  ## unique gene.
+  mat <- matrix(NA,
+                nrow=length(genes),
+                ncol=length(unique.genes))
+  colnames(mat) <- unique.genes
+  rownames(mat) <- names(genes)
+  
+  ## Fill in values of matrix with Estimates for each gene.  This fills
+  ## in a cell even if the gene is not a pathway.
+  for(i in rownames(mat)){ # Loop over each pathway
+    for(j in colnames(mat)){ # Loop over each gene.
+      if (j %in% genes[[i]]) {
+        val <- AssocData[AssocData$symbol == j, Estimate]
+        if (length(val) == 1) {
+          mat[i,j] <- val
+        } else {
+          mat[i,j] <- NA
+        }
+      } else
+        mat[i,j] <- NA
+    }
+  }
+  
+  # remove genes that have no expression values and order by p.value
+  mat <- mat[, colSums(is.na(mat)) !=nrow(mat), drop=F]
+  
+  AssocData <- AssocData[colnames(mat), ]
+  
+  # order genes by consensus, logfc or p.value
+  for (order in orderBy) {
+    if (order == "consensus"){
+      mat <- mat[, order(colSums(is.na(mat))), drop = F]
+    } else {
+      if (range(AssocData[[order]])[2] > 1) { # Check if logFC
+        mat <- mat[, order(abs(AssocData[[order]]), decreasing = T), drop = F]
+      } else {
+        mat <- mat[, order(AssocData[[order]]), drop = F]
+      }
+    }
+  }
+  
+  # trim gene list if too long
+  if (dim(mat)[2] > numGenes) {
+    mat <- mat[,1:numGenes, drop=F]
+  }
+  
+  # remove pathways that have no genes
+  mat <- mat[rowSums(is.na(mat)) !=ncol(mat), , drop=F]
+  
+  # Check if any genes are left
+  if (is.null(mat)) {
+    return("No genes pass filter")
+  }
+  
+  ## Order columns of mat by regression coeffiecient.  This makes it so
+  ## that all genes in the first pathway will be shown on the left side
+  ## of the plot.
+  for(i in 1:nrow(mat)){
+    mat <- mat[,order(mat[i,]), drop=F]
+  }
+  
+  ## Subset final mat
+  mat <- mat[nrow(mat):1, , drop=F]
+  
+  if(const == T){
+    if (is.null(max)) {
+      max <- max(abs(mat), na.rm=T)
+    }
+    seq <- seq(from = -max, to = max, length.out=20)
+    colors <- colorRampPalette(c('#1d587c','#2b83ba', '#abdda4','#ffffbf','#fdae61','#d7191c','#891012'))(length(seq))
+  } else {
+    seq <- seq(floor(min(mat, na.rm=T)), ceiling(max(mat, na.rm=T)), length.out=99)
+    colors <- colorRampPalette(c('#2b83ba', '#abdda4','#ffffbf','#fdae61','#d7191c'))(99)
+  }
+  
+  ## Create column annotation if present
+  if (!is.null(annotate_col_labels)) {
+    annotate_col <- AssocData[colnames(mat), annotate_col_labels, drop=F]
+  } else {
+    annotate_col <- NULL
+  }
+  
+  ## Create row annotation if present
+  if (!is.null(annotate_row_labels) & !is.null(PathwayData)) {
+    annotate_row <- PathwayData[rownames(mat), annotate_row_labels, drop=F]
+  } else {
+    annotate_row <- NULL
+  }
+  
+  
+  ## Create plot
+  
+  require(pheatmap)
+  
+  pheatmap(mat,
+           color=colors,
+           breaks=seq,
+           annotation_col=annotate_col,
+           annotation_row=annotate_row,
+           annotation_names_row=F,
+           annotation_names_col=F,
+           border_color='azure2',
+           cluster_cols=FALSE,
+           cluster_rows=FALSE,
+           cellheight = 12,
+           cellwidth = 12,
+           main = main,
+           labels_row = substr(rownames(mat),1,40),
+           fontsize=6,
+           silent = silent,
+           na_col = "#FFFFFF")
+  
+}
+
+# Based on code from http://michaeljw.com/blog/post/subchunkify/
+
+#' Generate a sub-chunk to be interpreted by knitr.  The enclosing chunk
+#' must have "results='asis'"
+#'
+#' @param g The output to chunkify (only tested with figures to date)
+#' @param ... Additional named arguments to the chunk
+#' @return NULL
+#' @details The chunk is automatically output to the console.  There is
+#'   no need to print/cat its result.
+#' @export
+subchunkify <- local({
+  chunk_count <- 0
+  function(g, ...) {
+    chunk_count <<- chunk_count + 1
+    g_deparsed <-
+      paste0(deparse(
+        function() {g}
+      ),
+      collapse = '')
+    args <- list(...)
+    args <-
+      lapply(names(args),
+             FUN=function(nm, arglist) {
+               current <- arglist[[nm]]
+               if (length(current) > 1) {
+                 stop("Only scalars are supported by subchunkify")
+               } else if (is.character(current) | is.factor(current)) {
+                 current <- as.character(current)
+                 ret <- paste0('"', gsub('"', '\"', current, fixed=TRUE), '"')
+               } else if (is.numeric(current) | is.logical(current)) {
+                 ret <- as.character(current)
+               } else {
+                 stop("Unhandled class in subchunkify argument handling")
+               }
+               paste0(nm, "=", ret)
+             },
+             arglist=args)
+    args <- paste0(unlist(args), collapse=", ")
+    chunk_header <-
+      paste(
+        paste0("{r sub_chunk_", chunk_count),
+        if (nchar(args) > 0) {
+          paste(",", args)
+        } else {
+          NULL
+        },
+        ", echo=FALSE}")
+    
+    sub_chunk <- paste0(
+      "\n```",chunk_header, "\n",
+      "(", 
+      g_deparsed
+      , ")()\n",
+      "```\n")
+    cat(knitr::knit(text = knitr::knit_expand(text = sub_chunk), quiet = TRUE))
+  }
+})
+
+
+lst_geneSets <- list()
+
+lst_geneSets[['Custom Ingenuity Pathway Analysis']]         <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Custom/Custom_IPA_CP_R.v2.gmt',type = 'broad')
+lst_geneSets[['MSigDB Hallmark']]           <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/h.all.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB Canonical Pathways']]  <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c2.cp.biocarta.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB KEGG']]      <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c2.cp.kegg.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB Reactome']]  <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c2.cp.reactome.v7.2.symbols.gmt',type = 'broad')
+#lst_geneSets[['MSigDB microRNA Targets']]     <- mapGmt2NamedList(gmtFileName = '../../../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c3.mir.v7.2.symbols.gmt',type = 'broad')
+#lst_geneSets[['MSigDB Transcriptional Factor Targets']]       <- mapGmt2NamedList(gmtFileName = '../../../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c3.tft.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB GO Biological Process']]      <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c5.go.bp.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB GO Cellular Component']]       <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c5.go.cc.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB GO Molecular Function']]       <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c5.go.mf.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB Oncogenic Signatures']] <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c6.all.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB Immunologic Signatures']]    <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c7.all.v7.2.symbols.gmt',type = 'broad')
+
+#lst_geneSets$GeoDE_microRNA         <- mapGmt2NamedList(gmtFileName = '../../../../Envs/ENVA_Annotations/GMT_Public/GMT_GeoDE/microRNA.gmt.RData',type = 'Rlist')
+
+lst_geneSets[['Celltype Signature Genesets']]    <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c8.all.v7.2.symbols.gmt',type = 'broad')
+
+lst_geneSets[['ConsensusPathDB Wikipathways']]   <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_CPDB/CPDB_Wikipathways.gmt',type = 'broad')
+lst_geneSets[['Custom Damian Pathways']]         <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Custom/Custom_DamianModules.gmt',type = 'broad')
+lst_geneSets[['Custom Nakaya Pathways']]        <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Custom/Custom_Nakaya.gmt',type = 'broad')
+
+colorSets <- function(n=2,colors.used=NULL) {
+  if ((n + length(colors.used)) <= 30) {
+    colors <- c('#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#fabebe', '#008080', '#e6beff', '#9a6324', 
+      '#800000', '#aaffc3', '#808000', '#ffd8b1', '#000075', '#808080', '#ffbf00', '#e6ccb3', '#8080ff', '#660000', '#006699', '#006600', 
+      '#660033', '#336699', '#cccc00', '#2d8659', '#666699', '#666666')
+    if (!is.null(colors.used)) {
+      colors <- colors[!colors %in% colors.used]
+    }
+    return(colors[1:n])
+  } else {
+	  distinctColorPalette(n)
+  }
+}
+
+```
+
+```{r read_project, results='hide'}
+
+## Read in the existing project
+
+AAA_PROJECT <- readRDS(file = "eset_norm_2022-03-22t14_36_02.RDS")
+
+## Put the structures that are needed in the space.
+eset_raw <- AAA_PROJECT$Esets$eset_raw
+
+# End of read project
+lst_contrast <- readRDS("save/Preliminary_Analysis_2022-03-29t12_02_00.RDS")
+
+```
+
+# Project Summary
+Samples are iPSC Cardiomyocyte (CDI and Axol)
+
+Numbers breakdown:
+
+
+```{r numbersBreakdown}
+
+table1 <- as.data.frame(table(eset_raw$group))
+colnames(table1) <- c("Group","Number in group")
+knitr::kable(table1,align = 'c')
+
+table2 <- as.data.frame(table(eset_raw$donor))
+colnames(table2) <- c("Group", "Number in group")
+knitr::kable(table2, align = 'c')
+
+
+```
+
+# Summary Tables {.tabset .tabset-pills}
+
+```{r showSummaryTable, results='asis'}
+
+table <- list()
+table2 <- list()
+
+for (nameOfSubset in names(lst_contrast$Analysis)) {
+  table2[[nameOfSubset]] <- data.frame()
+  table[[nameOfSubset]] <- data.frame()
+  theContrast <- lst_contrast$Analysis[[nameOfSubset]]
+  for (i in colnames(theContrast$contrasts)) {
+    # First table (degs)
+    table[[nameOfSubset]][i, "# of DEGs with P.value <= 0.05"] <- table(theContrast$DEG$results_full[, paste0(i, "_P.Value")] <= 0.05)[2]
+    table[[nameOfSubset]][i, "Adjusted P.value <= 0.10"] <- table(theContrast$DEG$results_full[, paste0(i, "_Adj_P.Value")] <= 0.10)[2]
+    
+    
+    table[[nameOfSubset]][is.na(table[[nameOfSubset]])] <- 0
+    
+    
+    for (theGeneSet in names(lst_geneSets)) {
+      table2[[nameOfSubset]][theGeneSet, i] <- table(theContrast$GSVA[[theGeneSet]]$results_full[, paste0(i, "_P.Value")] <= 0.05)[2]
+    }
+    table2[[nameOfSubset]][is.na(table2[[nameOfSubset]])] <- 0
+  }
+}
+
+
+# Pathways
+for (nameOfSubset in names(lst_contrast$Analysis)) {
+  cat("##", nameOfSubset, "\n\n")
+  cat("\n\n#### Differentially Expressed Genes\n\n")
+  print(knitr::kable(table[[nameOfSubset]], align = 'c'))
+  cat("\n\n")
+
+  cat("\n\n#### Pathways\n\n")
+  print(knitr::kable(table2[[nameOfSubset]], align = 'c'))
+  cat("\n\n")
+}
+
+```
+
+# Differentially Expressed Genes (DEGs) {.tabset .tabset-pills}
+
+```{r plotHeatmapTopGenes.subset, results='asis'}
+
+for (nameOfSubset in names(lst_contrast$Analysis)) {
+  cat("\n\n##", nameOfSubset, " {.tabset .tabset-pills}\n\n")
+  
+  # Setup the object
+  theContrast <- lst_contrast$Analysis[[nameOfSubset]]
+  
+  fullEset <- theContrast$DEG$eset
+    
+  # Setup colors for each phenotype
+  phenos <- names(which(apply(pData(fullEset), 2, function(x) length(na.omit(as.numeric(as.character(x))))) == 0))
+
+  phenos.colors <- sapply(phenos, function(pheno) {
+			  colors <- colorSets(length(unique(na.omit(fullEset[[pheno]]))))
+			  names(colors) <- unique(na.omit(fullEset[[pheno]]))
+			  return(colors)})    
+
+  fullDge       <-  DGEList(counts       =   exprs(fullEset),
+                                remove.zeros =   TRUE)
+  fullDge <-  calcNormFactors(object = fullDge, method = "TMM")
+  
+  topExprs <- cpm(fullDge, prior.count = 3, log=T)
+  
+  topTableFull  <- theContrast$DEG$results_full
+  
+  # Create Anova heatmap (optional)
+  if (F) {
+  
+  cat("##### Anova Heatmap")
+  
+  topTableTemp <- subset(topTableFull, topTableFull[, "Anova P.Value"] <= 0.05) 
+  
+  if (dim(topTableTemp)[1] < 50) {
+    n = dim(topTableTemp)[1]
+  } else {
+    n = 50
+  }
+
+  topTableTemp <- topTableTemp[order(topTableTemp[, "Anova P.Value"]), ]
+
+  topExprsTemp <- topExprs[rownames(topTableTemp[1:n,]),]
+  
+  topExprsTemp <- t(scale(t(topExprsTemp)))
+  
+  annotation_col <- pData(fullEset)[, c("group"), drop = F]
+  
+  annotation_row <- data.frame(PValue = topTableTemp[["Anova P.Value"]])
+  rownames(annotation_row) <- rownames(topTableTemp)
+  
+  seq <- seq(-3, 3, length.out = 99)
+  
+  colors <- colorRampPalette(c('#2b83ba', '#abdda4','#ffffbf','#fdae61','#d7191c'))(length(seq))
+  
+  p.plot <- pheatmap(topExprsTemp, scale="none", annotation_col = annotation_col, annotation_row = annotation_row, breaks = seq, color = colors, main = "Top 50 DEGs by Anova", cellwidth = 12, cellheight = 12, labels_row = topTableTemp[1:n, "gene_id"], labels_col = fullEset$donor.id, cluster_cols = T, silent = T, annotation_colors = phenos.colors)
+  
+  subchunkify(grid.draw(p.plot$gtable), 
+              fig.width = sum(convertWidth(p.plot$gtable$widths, "inches", valueOnly = T), 1), 
+              fig.height = sum(convertHeight(p.plot$gtable$heights, "inches", valueOnly = T), 1), 
+              fig.cap = "Anova Heatmap")
+  }
+  
+  cat("##### Per Contrast")
+  for(sort.method in c("P.Value", "logFC", "PCC")) {
+  
+    if (!any(grepl("PCC", colnames(topTableFull))) & sort.method == "PCC") {
+      next
+    }
+
+    cat("\n\n### Top By ", sort.method, "\n\n")
+    gene.list <- c()
+    
+    # Loop through each contrast
+    for (i in colnames(theContrast$contrasts)) {
+      # Subset eset according to contrast
+      if (grepl("Regressions", nameOfSubset)) {
+	tempEset <- fullEset
+      } else {
+        tempEset <- fullEset[, fullEset$group %in% names(which(theContrast$contrasts[, i] != 0))]
+      }
+      
+      # do not cluster if regression and setup colors
+      if (grepl("Regressions", nameOfSubset)) {
+        cluster.col = F
+        
+        # order by variable
+        tempEset <- tempEset[, order(as.numeric(tempEset[[i]]))]
+
+        # remove missing values
+        tempEset <- tempEset[, !is.na(tempEset[[i]])]
+
+	annotation_col <- data.frame(value = as.numeric(tempEset[[i]]))
+        colnames(annotation_col)[1] <- i
+        rownames(annotation_col) <- colnames(tempEset)
+	  
+        annotation_col <- cbind(annotation_col, pData(tempEset)[, c("group"), drop = F])
+	annotation_col <- annotation_col[, !duplicated(colnames(annotation_col))]
+
+      } else {
+        cluster.col = T
+        annotation_col <- pData(fullEset)[, c("group"), drop = F]
+
+      }
+      
+      # Order by donor.id
+      # tempEset <- tempEset[, order(tempEset$donor.id)]
+      
+      topTableTemp <- subset(topTableFull, topTableFull[, paste0(i, "_P.Value")] <= 0.05) # & topTableFull[, paste0(i, "_notLowCount")])
+      
+      # Update full list
+      gene.list <- c(gene.list, rownames(topTableTemp))
+      
+      if (dim(topTableTemp)[1] < 50) {
+        n = dim(topTableTemp)[1]
+      } else {
+        n = 50
+      }
+      
+      if (sort.method == "P.Value") {
+        topTableTemp <- topTableTemp[order(topTableTemp[, paste0(i, "_", sort.method)]), ]
+      } else {
+        topTableTemp <- topTableTemp[order(abs(topTableTemp[, paste0(i, "_", sort.method)]), decreasing = T), ]
+      }
+      
+      topExprsTemp <- topExprs[rownames(topTableTemp[1:n,]),]
+      topExprsTemp <- topExprsTemp[, sampleNames(tempEset)]
+      topExprsTemp <- t(scale(t(topExprsTemp)))
+      
+      annotation_row <- data.frame(logFC = topTableTemp[[paste0(i, "_logFC")]],
+                                   PValue = topTableTemp[[paste0(i, "_P.Value")]])
+      rownames(annotation_row) <- rownames(topTableTemp)
+      
+      seq <- seq(-3, 3,length.out = 99)
+      
+      colors <- colorRampPalette(c('#2b83ba', '#abdda4','#ffffbf','#fdae61','#d7191c'))(length(seq))
+      
+      p.plot <- pheatmap(topExprsTemp, scale="none", annotation_col = annotation_col, annotation_row = annotation_row, breaks = seq, color = colors, main = paste("Top 50 DEGs by", sort.method, i), cellwidth = 12, cellheight = 12, labels_row = topTableTemp[1:n, "gene_id"], labels_col = tempEset$donor.id, cluster_cols = cluster.col, silent = T, annotation_colors = phenos.colors)
+      
+      subchunkify(grid.draw(p.plot$gtable), 
+                  fig.width = sum(convertWidth(p.plot$gtable$widths, "inches", valueOnly = T), 1), 
+                  fig.height = sum(convertHeight(p.plot$gtable$heights, "inches", valueOnly = T), 1), 
+                  fig.cap = paste(i, "Heatmap"))
+    }
+    
+    # Setup datatables for loop
+    
+    table <- lst_contrast$Analysis[[nameOfSubset]]$DEG$results_full
+    table <- table[unique(gene.list), ]
+    table <- table[, -c(1: which(colnames(table) == "symbol"))]
+    table <- table[, !grepl("notLowCount", colnames(table))]
+    
+    # Fix Colnames
+    colnames(table) <- gsub("_", " ", colnames(table))
+    
+    # Order columns by regulation, p.value and logFC
+    table <- table[, c(grep("Regulation", colnames(table)), grep("P.Value", colnames(table)), grep("logFC", colnames(table)), grep("PCC", colnames(table)))]
+    
+    # Shorten numerical values to 3 significant digits
+    table[, c(grep("P.Value", colnames(table)), grep("logFC", colnames(table)), grep("PCC", colnames(table)))] <- signif(table[, c(grep("P.Value", colnames(table)), grep("logFC", colnames(table)), grep("PCC", colnames(table)))], 3)
+    rownames(table) <- paste0('<a href="https://www.genecards.org/cgi-bin/carddisp.pl?gene=', 
+                              rownames(table), '&keywords=', rownames(table), '" target="_blank">', rownames(table), '</a>')
+    subchunkify(datatable(table, extensions = c('Buttons', 'FixedColumns', 'Scroller'), options = list(
+      dom = 'Bfrtip',
+      buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+      scrollX = TRUE,
+      fixedColumns = TRUE,
+      deferRender = TRUE,
+      scrollY = 500,
+      scroller = TRUE
+    ),escape = F
+    ))
+   }
+}
+
+```
+
+# Differentially Expressed Pathways (DEPs) {.tabset .tabset-pills}
+>Top pathways by P.Value <= 0.05
+>Genes were filtered by P.Value <= 0.05
+
+```{r savePathways, results='asis'}
+
+for (nameOfSubset in names(lst_contrast$Analysis)) {
+  cat("\n\n##", nameOfSubset, " {.tabset .tabset-pills}\n\n")
+  
+  # Setup the objects
+  theContrast <- lst_contrast$Analysis[[nameOfSubset]]
+  
+  for (theGeneSet in names(lst_geneSets)) {
+    pathway.list <- c()
+    first <- TRUE
+      
+    # If being plotted, create title for the first in the geneSet and plot the anova heatmap
+    if (first) {
+      cat("\n\n###", theGeneSet, " {.tabset .tabset-pills}\n\n")
+      first <- FALSE
+    }
+    
+    # Pull expression values and stats for this geneSet
+    fullEset <- theContrast$GSVA[[theGeneSet]]$eset.gsva
+
+    # Setup colors for each phenotype
+    phenos <- names(which(apply(pData(fullEset), 2, function(x) length(na.omit(as.numeric(as.character(x))))) == 0))
+  
+    phenos.colors <- sapply(phenos, function(pheno) {
+			  colors <- colorSets(length(unique(na.omit(fullEset[[pheno]]))))
+			  names(colors) <- unique(na.omit(fullEset[[pheno]]))
+			  return(colors)})    
+
+    topTableFull  <- topTableTemp <- theContrast$GSVA[[theGeneSet]]$results_full
+    topExprs <- exprs(fullEset)
+   
+    anova = F
+    
+    if (dim(topTableTemp)[1] < 50) {
+      n = dim(topTableTemp)[1]
+    } else {
+      n = 50
+    }
+    
+    if (dim(topTableTemp)[1] == 0) { 
+      anova = F
+    } else if (dim(topTableTemp)[1] == 1) {
+      cluster.row = F
+    } else {
+      cluster.row = T
+    }
+    
+    if (anova) {
+    cat("##### Anova Heatmap")
+    
+    topTableTemp <- topTableTemp[order(topTableTemp[, "Anova P.Value"]), ]
+    
+    topExprsTemp <- topExprs[rownames(topTableTemp[1:n,]), ,drop=F]
+    
+    topExprsTemp <- t(scale(t(topExprsTemp)))
+    
+    annotation_col <- pData(fullEset)[, c("group"), drop = F]
+    
+    annotation_row <- data.frame(PValue = topTableTemp[["Anova P.Value"]])
+    rownames(annotation_row) <- rownames(topTableTemp)
+    
+    max <- max(abs(topExprsTemp))
+    min <- min(abs(c(quantile(topExprsTemp, .01), quantile(topExprsTemp, .99))))
+    
+    seq <- seq(-3, 3, length.out = 99)
+    
+    colors <- colorRampPalette(c('#2b83ba', '#abdda4','#ffffbf','#fdae61','#d7191c'))(length(seq))
+    
+    p.plot <- pheatmap(topExprsTemp, scale="none", annotation_col = annotation_col, annotation_row = annotation_row, breaks = seq, color = colors, main = "Top 50 DEPs by Anova", cellwidth = 12, cellheight = 12, labels_row = rownames(topTableTemp[1:n, ]), labels_col = fullEset$donor.id, cluster_cols = T, cluster_rows = cluster.row, silent = T, annotation_colors = phenos.colors)
+    
+    subchunkify(grid.draw(p.plot$gtable), 
+              fig.width = sum(convertWidth(p.plot$gtable$widths, "inches", valueOnly = T), 1), 
+              fig.height = sum(convertHeight(p.plot$gtable$heights, "inches", valueOnly = T), 1), 
+              fig.cap = "Anova Heatmap")
+    }
+
+    cat("\n\n##### Per Contrast")
+    
+    # Loop through each Contrast
+    for(sort.method in c("P.Value", "logFC", "PCC")) {
+    
+      if (!any(grepl("PCC", colnames(topTableFull))) & sort.method == "PCC") {
+        next
+      }
+
+      cat("\n\n#### Top By ", sort.method, "\n\n")
+      gene.list <- c()
+      
+      for (i in colnames(theContrast$contrasts)) {
+        # Subset eset according to contrast
+        if (grepl("Regressions", nameOfSubset)) {
+          tempEset <- fullEset
+        } else {
+          tempEset <- fullEset[, fullEset$group %in% names(which(theContrast$contrasts[, i] != 0))]
+        }
+        
+        # do not cluster if regression and setup colors
+        if (grepl("Regressions", nameOfSubset)) {
+          cluster.col = F
+          
+          # order by group
+          tempEset <- tempEset[, order(as.numeric(tempEset[[i]]))]
+        
+          # remove missing values
+          tempEset <- tempEset[, !is.na(tempEset[[i]])]
+        
+	  annotation_col <- data.frame(value = as.numeric(tempEset[[i]]))
+          colnames(annotation_col)[1] <- i
+          rownames(annotation_col) <- colnames(tempEset)
+
+          annotation_col <- cbind(annotation_col, pData(tempEset)[, c("group"), drop = F])
+	  annotation_col <- annotation_col[, !duplicated(colnames(annotation_col))]
+
+        } else {
+          cluster.col = T
+          annotation_col <- pData(fullEset)[, c("group"), drop = F]
+
+        }
+        
+        topTableTemp <- subset(topTableFull, topTableFull[, paste0(i, "_P.Value")] <= 0.05) # & topTableFull[, paste0(i, "_notLowCount")])
+        pathway.list <- c(pathway.list, rownames(topTableTemp))
+        
+        if (dim(topTableTemp)[1] < 50) {
+          n = dim(topTableTemp)[1]
+        } else {
+          n = 50
+        }
+        
+        if (dim(topTableTemp)[1] == 0) {
+          next
+        } else if (dim(topTableTemp)[1] == 1) {
+          cluster.row = F
+        } else {
+          cluster.row = T
+        }
+        
+        if (sort.method == "P.Value") {
+          topTableTemp <- topTableTemp[order(topTableTemp[, paste0(i, "_", sort.method)]), ]
+        } else {
+          topTableTemp <- topTableTemp[order(abs(topTableTemp[, paste0(i, "_", sort.method)]), decreasing = T), ]
+        }
+        
+        # Setup heatmap values
+        topExprsTemp <- topExprs[rownames(topTableTemp[1:n,]), ,drop=F]
+        
+        # Order by Regression var
+        #tempEset <- tempEset[, order(tempEset[[i]]), drop = F]
+        topExprsTemp <- topExprsTemp[, sampleNames(tempEset), drop = F]
+        
+        topExprsTemp <- t(scale(t(topExprsTemp)))
+        
+        annotation_row <- data.frame(logFC = topTableTemp[[paste0(i, "_logFC")]],
+                                     PValue = topTableTemp[[paste0(i, "_P.Value")]])
+        rownames(annotation_row) <- rownames(topTableTemp)
+        
+        seq <- seq(-3, 3, length.out = 99)
+        
+        colors <- colorRampPalette(c('#2b83ba', '#abdda4','#ffffbf','#fdae61','#d7191c'))(length(seq))
+      
+        p.plot <- pheatmap::pheatmap(topExprsTemp, scale="none", annotation_col = annotation_col, annotation_row = annotation_row, breaks = seq, color = colors, main = paste("Top 50 DEPs by", sort.method, i), cellwidth = 12, cellheight = 12, fontsize = 6, labels_row = topTableTemp[1:n, "gene_id"], labels_col = tempEset$donor.id, cluster_cols = cluster.col, cluster_rows = cluster.row, silent = T, annotation_colors = phenos.colors)
+        
+        fig.width = sum(convertWidth(p.plot$gtable$widths, "inches", valueOnly = T), 1)
+        fig.height = sum(convertHeight(p.plot$gtable$heights, "inches", valueOnly = T), 1)
+        
+        subchunkify(grid.draw(p.plot$gtable), 
+                  fig.width = fig.width, 
+                  fig.height = ifelse(fig.height < 4, fig.height + (4 - fig.height), fig.height), 
+                  fig.cap = paste(i, "Heatmap"),
+                  fig.retina = 2)
+        
+        #### Create the checkerboard
+        topGenes  <- theContrast$DEG$results_full
+        topGenes <- subset(topGenes, topGenes[, paste0(i, "_P.Value")] <= 0.05)
+        
+        geneList <- lst_geneSets[[theGeneSet]][rownames(topTableTemp[1:n,])]
+        if (length(geneList) < 20) {
+          geneList <- geneList[1:length(geneList)]
+        } else {
+          geneList <- geneList[1:20]
+        }
+        
+        if (sum(unique(unlist(geneList)) %in% rownames(topGenes)) < 2) {
+          next
+        }
+        
+        p.plot <- gradient.hm(genes = geneList
+                    , AssocData = topGenes
+                    , PathwayData = topTableFull
+                    , Estimate = paste0(i, "_logFC")
+                    , orderBy = c(paste0(i, "_", sort.method), "consensus")
+                    , const = T
+                    , annotate_col = paste0(i, "_P.Value")
+                    , annotate_row = c(paste0(i, "_logFC"))
+                    , main = paste(i, theGeneSet, "By", sort.method)
+                    , silent = T)
+        
+        fig.width = sum(convertWidth(p.plot$gtable$widths, "inches", valueOnly = T), 1)
+        fig.height = sum(convertHeight(p.plot$gtable$heights, "inches", valueOnly = T), 1)
+        
+        subchunkify(grid.draw(p.plot$gtable), 
+                  fig.width = fig.width, 
+                  fig.height = ifelse(fig.height < 3, fig.height + (3-fig.height), fig.height), 
+                  fig.cap = paste(i, "Checkerboard"),
+                  fig.retina = 2)
+        
+      }
+      
+      rm(table)
+      
+      table <- theContrast$GSVA[[theGeneSet]]$results_full
+      table <- table[unique(pathway.list), ]
+      #table <- table[, -c(1: which(colnames(table) == "symbol"))]
+      
+      # Fix Colnames
+      colnames(table) <- gsub("_", " ", colnames(table))
+      
+      # Order columns by regulation, p.value and logFC
+      table <- table[, c(grep("Regulation", colnames(table)), grep("P.Value", colnames(table)), grep("logFC", colnames(table)), grep("PCC", colnames(table)))]
+      
+      # Shorten numerical values to 3 significant digits
+      table[, c(grep("P.Value", colnames(table)), grep("logFC", colnames(table)), grep("PCC", colnames(table)))] <- signif(table[, c(grep("P.Value", colnames(table)), grep("logFC", colnames(table)), grep("PCC", colnames(table)))], 3)
+      
+      # # Fix Rownames
+      # table <- cbind("Pathway" = gsub("_", " ", rownames(table)), table)
+      # rownames(table) <- NULL
+
+      subchunkify(datatable(table, extensions = c('Buttons', 'FixedColumns', 'Scroller'),
+                            options = list(
+                              autowidth = TRUE,
+                              dom = 'Bfrtip',
+                              buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                              deferRender = TRUE,
+                              fixedColumns = TRUE,
+                              scrollY = 500,
+                              scrollX = 200,
+                              scroller = TRUE,
+                              columnDefs = list(list(
+                                targets = 0,
+                                render = JS(
+                                  "function(data, type, row, meta) {",
+                                  "return type === 'display' && data.length > 20 ?",
+                                  "'<span title=\"' + data + '\">' + data.substr(0, 20) + '...</span>' : data; ",
+                                  "}")
+                              ))
+                            )
+      ))
+    }
+  }
+}
+
+
+```
+
+
+# Session Info
+
+```{r session_info, results='markup'}
+Hmisc::markupSpecs$html$session()
+```
+
+# Reference Tables {.tabset .tabset-pills}
+
+## Full Gene Table
+
+```{r setup Final Gene Table}
+table <- c()
+for(nameOfSubset in names(lst_contrast$Analysis)) { 
+  
+  tempTable <- lst_contrast$Analysis[[nameOfSubset]]$DEG$results_full
+  
+  # Fix Colnames
+  colnames(tempTable) <- gsub("_", " ", colnames(tempTable))
+  colnames(tempTable) <- paste(nameOfSubset, colnames(tempTable))
+  
+  if (is.null(dim(table))) {
+    table <- tempTable
+  } else {
+    ids <- c(rownames(table, tempTable))
+    table <- cbind(table[ids, ], tempTable[ids, ])
+    rownames(table) <- ids
+  }
+}
+
+# Order columns by regulation, p.value and logFC
+table <- table[, c(grep("Regulation", colnames(table)), grep("P.Value", colnames(table)), grep("logFC", colnames(table)), grep("PCC", colnames(table)))]
+
+# Shorten numerical values to 3 significant digits
+table[, c(grep("P.Value", colnames(table)), grep("logFC", colnames(table)), grep("PCC", colnames(table)))] <- signif(table[, c(grep("P.Value", colnames(table)), grep("logFC", colnames(table)), grep("PCC", colnames(table)))], 3)
+
+datatable(table, extensions = c('Buttons', 'FixedColumns', 'Scroller'), options = list(
+  dom = 'Bfrtip',
+  buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+  scrollX = TRUE,
+  fixedColumns = TRUE,
+  deferRender = TRUE,
+  scrollY = 500,
+  scroller = TRUE
+)
+)
+
+```
+
+## Full Pathway Table
+
+```{r setup Final pathway table, eval = F}
+
+
+# Generate a searchable table instead of excel worksheets
+# Concatenate all of the test statistics
+
+for(nameOfSubset in names(lst_contrast$Analysis)) { 
+  tempTableSet <- c()
+  for(theGeneSet in names(lst_geneSets)) {
+    tempTable <- lst_contrast$Analysis[[nameOfSubset]]$GSVA[[theGeneSet]]$results_full
+    
+    # Fix Colnames
+    colnames(tempTable) <- gsub("_", " ", colnames(tempTable))
+    colnames(tempTable) <- paste(nameOfSubset, colnames(tempTable))
+    
+    if (is.null(dim(tempTableSet))) {
+      tempTableSet <- cbind("Pathway" = rownames(tempTable), "Pathway DB" = rep(theGeneSet, dim(tempTable)[1]), tempTable, "uniqueID" = paste(theGeneSet, rownames(tempTable), sep = "|"))
+    } else {
+      tempTableSet <- rbind(tempTableSet, cbind("Pathway" = rownames(tempTable), "Pathway DB" = rep(theGeneSet, dim(tempTable)[1]), tempTable, "uniqueID" = paste(theGeneSet, rownames(tempTable), sep = "|")))
+    }
+  }
+  if (is.null(dim(table))) {
+    table <- tempTableSet
+  } else {
+    ids <- unique(c(as.character(table$uniqueID), as.character(tempTableSet$uniqueID)))
+    table <- cbind(table[match(ids, table$uniqueID), ], tempTableSet[match(ids, tempTableSet$uniqueID), ])
+  }
+}
+
+# Order columns by regulation, p.value and logFC
+table <- table[, c(1:2, grep("Regulation", colnames(table)), grep("P.Value", colnames(table)), grep("logFC", colnames(table)), grep("PCC", colnames(table)))]
+
+# Shorten numerical values to 3 significant digits
+table[, c(grep("P.Value", colnames(table)), grep("logFC", colnames(table)), grep("PCC", colnames(table)))] <- signif(table[, c(grep("P.Value", colnames(table)), grep("logFC", colnames(table)), grep("PCC", colnames(table)))], 3)
+
+# # Fix Rownames
+# table <- cbind("Pathway" = gsub("_", " ", rownames(table)), table)
+# rownames(table) <- NULL
+
+datatable(table, rownames = F, extensions = c('Buttons', 'FixedColumns', 'Scroller'),      
+          options = list(
+            autowidth = TRUE,
+            dom = 'Bfrtip',
+            buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+            deferRender = TRUE,
+            fixedColumns = TRUE,
+            scrollY = 500,
+            scrollX = 200,
+            scroller = TRUE,
+            columnDefs = list(list(
+              targets = 0,
+              render = JS(
+                "function(data, type, row, meta) {",
+                "return type === 'display' && data.length > 20 ?",
+                "'<span title=\"' + data + '\">' + data.substr(0, 20) + '...</span>' : data; ",
+                "}")
+            ))
+          )
+)
+
+```
+
+
+```{r Session Info, results='markup'}
+
+Hmisc::markupSpecs$html$session()
+
+```

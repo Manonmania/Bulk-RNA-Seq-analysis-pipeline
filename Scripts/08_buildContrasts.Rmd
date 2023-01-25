@@ -1,0 +1,649 @@
+---
+title: "iPSC Cardiomyocyte Characterization"
+author: "Manonmani Kumar"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  rmdformats::html_clean:
+    highlight: kate
+    toc_depth: 1
+    gallery: true
+---
+
+```{r knitr_init, echo=FALSE, cache=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="95")
+opts_chunk$set(echo=FALSE,
+               cache=FALSE,
+               prompt=FALSE,
+               tidy=FALSE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE,
+               fig.retina = 1.5,
+               pngquant = '--speed=1 --nofs')
+opts_knit$set(width=95)
+
+## IMG optimization
+knit_hooks$set(pngquant = hook_pngquant)
+```
+
+```{r LoadLibraries, results='hide'}
+# Set Java limit before libraries
+options(java.parameters = "-Xmx4000m")
+
+# Always Load these libraries
+# CRAN
+library(assertthat)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(openxlsx)
+library(DT)
+library(pheatmap)
+library(stats)
+
+# Bioconductor
+library(Biobase)
+library(impute)
+library(edgeR)
+library(limma)
+library(genefilter)
+suppressMessages(library(GSVA))
+library(ggplot2)
+
+
+# Optional
+
+library(knitr)
+library(VennDiagram)
+flog.threshold(ERROR)
+library(RColorBrewer)
+
+# Set Random Seed for
+base::set.seed(42) # Because 42 is the answer to everything in a random universe.
+```
+
+```{r functions, results='hide'}
+
+mapGmt2NamedList <- function(gmtFileName=NULL, type='simple') {
+  # This function  takes in a GMT file and creates a named list
+  if(type == 'Rlist') {
+    fieldStart = 2
+  }else if(type == 'simple') {
+    # means name\tgene1\tgene2\t...
+    # if default type is simple set to 2
+    fieldStart = 2
+  } else if (type == 'broad'){
+    # name\tURL\t\gene1\t\gene2\
+    # if the default type is broad, set to 3
+    fieldStart = 3
+  } else {
+    # if there default is missing
+    # Same as broad but 2nd position is not necessarily URL
+    fieldStart = 3
+  }
+  geneSet <- list()
+  if (type=='Rlist') {
+    load(file = gmtFileName,verbose = FALSE)
+    gmtFile <- gmt
+    rm(gmt)
+    for (entry in gmtFile) {
+      geneSet[[unlist(entry[1])[1]]] <- entry[fieldStart:length(entry)]
+    }
+  } else {
+    geneSet <- list()
+    gmtFile <- readLines(con=gmtFileName)
+    gmtFile <- strsplit(gmtFile, '\t')
+    
+    for (entry in gmtFile) {
+      entry <- unlist(entry)
+      geneSet[[unlist(entry[1])[1]]] <- entry[fieldStart:length(entry)]
+    }
+  }
+  
+  rm(gmtFile,entry, gmtFileName,type)
+  
+  geneSet
+}
+
+
+
+gradient.hm <- function(genes=geneSet,
+                        AssocData=toptable,
+                        PathwayData=NULL,
+                        Estimate='logFC',
+                        const=F,
+                        max=NULL,
+                        numGenes=50,
+                        orderBy="consensus",
+                        annotate_col_labels=NULL,
+                        annotate_row_labels=NULL,
+                        main="Checkerboard",
+                        silent=F){
+  
+  ## Get unique gene symbols from all pathways
+  unique.genes <- na.omit(unique(do.call(c, genes)))
+  
+  ## Create matrix.  One row for each pathway.  One column for each
+  ## unique gene.
+  mat <- matrix(NA,
+                nrow=length(genes),
+                ncol=length(unique.genes))
+  colnames(mat) <- unique.genes
+  rownames(mat) <- names(genes)
+  
+  ## Fill in values of matrix with Estimates for each gene.  This fills
+  ## in a cell even if the gene is not a pathway.
+  for(i in rownames(mat)){ # Loop over each pathway
+    for(j in colnames(mat)){ # Loop over each gene.
+      if (j %in% genes[[i]]) {
+        val <- AssocData[AssocData$symbol == j, Estimate]
+        if (length(val) == 1) {
+          mat[i,j] <- val
+        } else {
+          mat[i,j] <- NA
+        }
+      } else
+        mat[i,j] <- NA
+    }
+  }
+  
+  # remove genes that have no expression values and order by p.value
+  mat <- mat[, colSums(is.na(mat)) !=nrow(mat), drop=F]
+  
+  AssocData <- AssocData[colnames(mat), ]
+  
+  # order genes by consensus, logfc or p.value
+  for (order in orderBy) {
+    if (order == "consensus"){
+      mat <- mat[, order(colSums(is.na(mat))), drop = F]
+    } else {
+      if (range(AssocData[[order]])[2] > 1) { # Check if logFC
+        mat <- mat[, order(abs(AssocData[[order]]), decreasing = T), drop = F]
+      } else {
+        mat <- mat[, order(AssocData[[order]]), drop = F]
+      }
+    }
+  }
+  
+  # trim gene list if too long
+  if (dim(mat)[2] > numGenes) {
+    mat <- mat[,1:numGenes, drop=F]
+  }
+  
+  # remove pathways that have no genes
+  mat <- mat[rowSums(is.na(mat)) !=ncol(mat), , drop=F]
+  
+  # Check if any genes are left
+  if (is.null(mat)) {
+    return("No genes pass filter")
+  }
+  
+  ## Order columns of mat by regression coeffiecient.  This makes it so
+  ## that all genes in the first pathway will be shown on the left side
+  ## of the plot.
+  for(i in 1:nrow(mat)){
+    mat <- mat[,order(mat[i,]), drop=F]
+  }
+  
+  ## Subset final mat
+  mat <- mat[nrow(mat):1, , drop=F]
+  
+  if(const == T){
+    if (is.null(max)) {
+      max <- max(abs(mat), na.rm=T)
+    }
+    seq <- seq(from = -max, to = max, length.out=20)
+    colors <- colorRampPalette(c('#1d587c','#2b83ba', '#abdda4','#ffffbf','#fdae61','#d7191c','#891012'))(length(seq))
+  } else {
+    seq <- seq(floor(min(mat, na.rm=T)), ceiling(max(mat, na.rm=T)), length.out=99)
+    colors <- colorRampPalette(c('#2b83ba', '#abdda4','#ffffbf','#fdae61','#d7191c'))(99)
+  }
+  
+  ## Create column annotation if present
+  if (!is.null(annotate_col_labels)) {
+    annotate_col <- AssocData[colnames(mat), annotate_col_labels, drop=F]
+  } else {
+    annotate_col <- NULL
+  }
+  
+  ## Create row annotation if present
+  if (!is.null(annotate_row_labels) & !is.null(PathwayData)) {
+    annotate_row <- PathwayData[rownames(mat), annotate_row_labels, drop=F]
+  } else {
+    annotate_row <- NULL
+  }
+  
+  
+  ## Create plot
+  
+  require(pheatmap)
+  
+  pheatmap(mat,
+           color=colors,
+           breaks=seq,
+           annotation_col=annotate_col,
+           annotation_row=annotate_row,
+           annotation_names_row=F,
+           annotation_names_col=F,
+           border_color='azure2',
+           cluster_cols=FALSE,
+           cluster_rows=FALSE,
+           cellheight = 12,
+           cellwidth = 12,
+           main = main,
+           labels_row = substr(rownames(mat),1,40),
+           fontsize=6,
+           silent = silent,
+           na_col = "#FFFFFF")
+  
+}
+
+
+collapseProbes <- function(x, method = "variance", topTable = NULL, colNameOfStat = NULL, 
+                           colNameOfGeneSymbol = "Symbol") 
+{
+  if (!(method %in% list("variance", "logFC", "P.Value", "adj.P.Value"))) {
+    stop("Method ", paste(method, "not supported"))
+  }
+  if (is.data.frame(topTable)) {
+    if (!(method %in% list("variance", "logFC", "P.Value", 
+                           "adj.P.Value"))) {
+      stop("Method ", paste(method, "not supported"))
+    }
+    if (!(colNameOfGeneSymbol %in% colnames(topTable))) {
+      stop(paste(colNameOfGeneSymbol, "must be a column in topTable"))
+    }
+  }
+  if (!is.matrix(x)) {
+    mat_exprs <- exprs(x)
+  }
+  if (method == "variance") {
+    cat("Processing eset using:", method, "\n")
+    vec_variance <- apply(mat_exprs, 1, var)
+    vec_symbol <- fData(x)[rownames(mat_exprs), colNameOfGeneSymbol]
+    df_xref <- data.frame(mat_exprs, variance = vec_variance)
+    df_xref <- cbind(df_xref, SYMBOL = vec_symbol, probeID = rownames(mat_exprs))
+    df_xref <- df_xref[order(df_xref[[method]], decreasing = T), 
+                       ]
+    uniqueGeneList <- unique(df_xref[[colNameOfGeneSymbol]])
+    new_matrix <- df_xref[match(uniqueGeneList, table = df_xref[[colNameOfGeneSymbol]]), 
+                          ]
+    rownames(new_matrix) <- new_matrix[[colNameOfGeneSymbol]]
+    mat_exprs <- new_matrix[, colnames(mat_exprs)]
+    x <- x[as.vector(new_matrix$probeID), ]
+    esetToReturn <- x
+    featureNames(x) <- rownames(mat_exprs)
+    exprs(x) <- as.matrix(mat_exprs)
+    new_fData <- new_matrix[, c("SYMBOL", "variance", "probeID")]
+    rownames(new_fData) <- new_fData[[colNameOfGeneSymbol]]
+    fData(x) <- new_fData
+    exprs(x) <- exprs(x)[, rownames(pData(x))]
+  }
+  else if (method == "logFC") {
+    cat("Processing eset using:", method, "\n")
+    topTable <- topTable[order(topTable[[method]], decreasing = TRUE), 
+                         ]
+    df_xref <- df_xref[rownames(topTable), ]
+    if (!assertthat::are_equal(rownames(df_xref), rownames(topTable))) {
+      stop("Matrix rows do not match topTable rows in method=logFC")
+    }
+    df_xref <- cbind(df_xref, topTable)
+    df_xref[[colNameOfGeneSymbol]] <- df_xref[[colNameOfGeneSymbol]]
+    df_xref <- df_xref[order(df_xref[[method]], decreasing = T), 
+                       ]
+    uniqueGeneList <- unique(df_xref[[colNameOfGeneSymbol]])
+    new_matrix <- df_xref[match(uniqueGeneList, table = df_xref[[colNameOfGeneSymbol]]), 
+                          ]
+    mat_exprs <- new_matrix[, colnames(mat_exprs)]
+    rownames(mat_exprs) <- as.vector(new_matrix[[colNameOfGeneSymbol]])
+    esetToReturn <- x[as.vector(new_matrix$probeID), ]
+    exprs(esetToReturn) <- as.matrix(mat_exprs)
+    new_fData <- new_matrix[, c("SYMBOL", "variance", "probeID")]
+    rownames(new_fData) <- new_fData[[colNameOfGeneSymbol]]
+    fData(esetToReturn) <- new_fData
+    assertthat::are_equal(rownames(exprs(esetToReturn)), 
+                          rownames(fData(esetToReturn)))
+  }
+  esetToReturn
+}
+
+# Based on code from http://michaeljw.com/blog/post/subchunkify/
+
+#' Generate a sub-chunk to be interpreted by knitr.  The enclosing chunk
+#' must have "results='asis'"
+#'
+#' @param g The output to chunkify (only tested with figures to date)
+#' @param ... Additional named arguments to the chunk
+#' @return NULL
+#' @details The chunk is automatically output to the console.  There is
+#'   no need to print/cat its result.
+#' @export
+subchunkify <- local({
+  chunk_count <- 0
+  function(g, ...) {
+    chunk_count <<- chunk_count + 1
+    g_deparsed <-
+      paste0(deparse(
+        function() {g}
+      ),
+      collapse = '')
+    args <- list(...)
+    args <-
+      lapply(names(args),
+             FUN=function(nm, arglist) {
+               current <- arglist[[nm]]
+               if (length(current) > 1) {
+                 stop("Only scalars are supported by subchunkify")
+               } else if (is.character(current) | is.factor(current)) {
+                 current <- as.character(current)
+                 ret <- paste0('"', gsub('"', '\"', current, fixed=TRUE), '"')
+               } else if (is.numeric(current) | is.logical(current)) {
+                 ret <- as.character(current)
+               } else {
+                 stop("Unhandled class in subchunkify argument handling")
+               }
+               paste0(nm, "=", ret)
+             },
+             arglist=args)
+    args <- paste0(unlist(args), collapse=", ")
+    chunk_header <-
+      paste(
+        paste0("{r sub_chunk_", chunk_count),
+        if (nchar(args) > 0) {
+          paste(",", args)
+        } else {
+          NULL
+        },
+        ", echo=FALSE}")
+    
+    sub_chunk <- paste0(
+      "\n```",chunk_header, "\n",
+      "(", 
+      g_deparsed
+      , ")()\n",
+      "```\n")
+    cat(knitr::knit(text = knitr::knit_expand(text = sub_chunk), quiet = TRUE))
+  }
+})
+
+
+lst_geneSets <- list()
+
+lst_geneSets[['Custom Ingenuity Pathway Analysis']]         <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Custom/Custom_IPA_CP_R.v2.gmt',type = 'broad')
+lst_geneSets[['MSigDB Hallmark']]           <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/h.all.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB Canonical Pathways']]  <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c2.cp.biocarta.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB KEGG']]      <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c2.cp.kegg.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB Reactome']]  <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c2.cp.reactome.v7.2.symbols.gmt',type = 'broad')
+#lst_geneSets[['MSigDB microRNA Targets']]     <- mapGmt2NamedList(gmtFileName = '../../../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c3.mir.v7.2.symbols.gmt',type = 'broad')
+#lst_geneSets[['MSigDB Transcriptional Factor Targets']]       <- mapGmt2NamedList(gmtFileName = '../../../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c3.tft.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB GO Biological Process']]      <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c5.go.bp.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB GO Cellular Component']]       <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c5.go.cc.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB GO Molecular Function']]       <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c5.go.mf.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB Oncogenic Signatures']] <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c6.all.v7.2.symbols.gmt',type = 'broad')
+lst_geneSets[['MSigDB Immunologic Signatures']]    <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c7.all.v7.2.symbols.gmt',type = 'broad')
+
+#lst_geneSets$GeoDE_microRNA         <- mapGmt2NamedList(gmtFileName = '../../../../Envs/ENVA_Annotations/GMT_Public/GMT_GeoDE/microRNA.gmt.RData',type = 'Rlist')
+
+lst_geneSets[['Celltype Signature Genesets']]    <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_MsigDB/msigdb_v7.2_GMTs/c8.all.v7.2.symbols.gmt',type = 'broad')
+
+lst_geneSets[['ConsensusPathDB Wikipathways']]   <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Public/GMT_CPDB/CPDB_Wikipathways.gmt',type = 'broad')
+lst_geneSets[['Custom Damian Pathways']]         <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Custom/Custom_DamianModules.gmt',type = 'broad')
+lst_geneSets[['Custom Nakaya Pathways']]        <- mapGmt2NamedList(gmtFileName = '../../Envs/ENVA_Annotations/GMT_Custom/Custom_Nakaya.gmt',type = 'broad')
+
+```
+
+```{r read_project, results='hide'}
+
+## Read in the existing project eset_qc
+AAA_PROJECT <- readRDS(file = "eset_norm_2022-03-22t14_36_02.RDS")
+
+## Put the structures that are needed in the space.
+eset_raw <- AAA_PROJECT$Esets$eset_raw
+
+# End of read project
+
+# Create list to be populated, comment out after analysis is finished, note which chunks are run during knitting to get an idea of the flow
+lst_contrast <- list()
+lst_contrast$ProjectInfo <- list()
+lst_contrast$ProjectInfo$SessionInfo <- sessionInfo()
+lst_contrast$Analysis <- list()
+
+```
+
+```{r contrast.group, eval=FALSE}
+
+# Setup subsets:
+subsets <- list("Group Analysis" = eset_raw)
+
+# Perform case/switch control for each potential combination
+for (nameOfSubset in names(subsets)) {
+
+  eset_temp <- subsets[[nameOfSubset]]
+  
+  sampleNames(eset_temp) <- eset_temp$Sample_ID
+    
+  dge       <-  DGEList(counts       =   exprs(eset_temp),
+                        remove.zeros =   TRUE)
+  
+  #Filter level by lowest group, make sure at least in 1 group at least half of the samples have measurable counts
+  # Filter
+  
+  cpm.temp <- cpm(dge)
+ 
+  # Select the group to filter the eset by
+
+  group.sel <- switch(nameOfSubset,
+	 "Group Analysis" = "group")
+  
+  #group.sel <- "group"
+
+  keep <- apply(sapply(as.character(unique(eset_temp[[group.sel]])), function(group) {
+    rowSums(cpm.temp[, eset_temp[[group.sel]] == group] > 0) >= ceiling(table(eset_temp[[group.sel]])[[group]]/2)
+  }), 1, any)
+  
+  dge <- dge[keep, , keep.lib.sizes=FALSE]
+  dge <-  calcNormFactors(object = dge, method = "TMM")
+  
+  logCPM <- cpm(dge, log=TRUE, prior.count=3)
+
+  # Setup groups
+
+  group <- eset_temp$group <- switch(nameOfSubset,
+	 "Group Analysis" = eset_temp$group)
+  
+  donor <- eset_temp$donor
+
+  # Create design matrix
+  
+   design.mat <- model.matrix(~0 + group)
+   
+    rownames(design.mat) <- sampleNames(eset_temp)
+    colnames(design.mat) <- gsub(pattern     = "group",
+                                 replacement = "",
+                                 colnames(design.mat))
+  
+    # Remove dependent columns
+    if (!is.null(nonEstimable(design.mat))) {
+  	  design.mat <- design.mat[, !colnames(design.mat) %in% nonEstimable(design.mat)]
+    }
+    
+    contrasts <- switch(nameOfSubset,
+	 "Group Analysis" = makeContrasts("Axol vs CDI" = "Axol-CDI",
+                                      levels = design.mat))
+  
+
+  # Test for dges, remove samples that are not present in the design matrix
+  design.mat.temp <- na.omit(design.mat)
+
+  logCPM.temp  <- logCPM[, rownames(design.mat.temp)]
+  fit <- lmFit(logCPM.temp, na.omit(design.mat.temp))
+
+  #
+  ## Collect the F test results
+  fit2 <- contrasts.fit(fit, contrasts = contrasts)
+  fit2 <- eBayes(fit2, trend=TRUE)
+  
+  df_filtered_topF <- topTableF(fit2, number = Inf, sort.by = 'none')
+  df_filtered_topF[["Anova P.Value"]] <- df_filtered_topF[["P.Value"]]
+  df_filtered_topF[["symbol"]] <- rownames(df_filtered_topF)
+  
+  for (i in colnames(contrasts)) {
+
+    if (!grepl("Regressions", nameOfSubset)) {
+     fit <- lmFit(logCPM, design.mat)
+     fit2 <- contrasts.fit(fit, contrasts = contrasts[, i])
+    } else {
+      design.mat.temp <- design.mat[, c(1, which(contrasts[,i] == 1)), drop = F]
+
+      # Add blocking variables (optional)
+      #design.mat.temp <- cbind(design.mat.temp, model.matrix(~ batch)[, -1])
+      design.mat.temp <- na.omit(design.mat.temp)
+      logCPM.temp  <- logCPM[, rownames(design.mat.temp)]
+      fit <- lmFit(logCPM.temp, design.mat.temp)
+      #fit2 <- contrasts.fit(fit, contrasts = c(0,1,0))
+      fit2 <- contrasts.fit(fit, contrasts = c(0,1))
+    }
+    
+    fit2 <- eBayes(fit2, trend=TRUE)
+    
+    df_filtered_topFTemp <- topTable(fit2, number = Inf, sort.by = 'none')
+    #results <- decideTests(fit2, adjust.method = 'none', p.value = 0.05)
+    #results <- as.vector(ifelse(results == 1, "Up", ifelse(results == -1, "Dn", "N.s.")))
+    #results <- as.vector(ifelse(results < 0, "Dn", "Up"))
+    results <- as.vector(decideTests(fit2, adjust.method = 'none', p.value = 0.05))
+    results <- ifelse(results == 1, "Up", ifelse(results == -1, "Dn", "N.s."))
+
+    
+    df_filtered_topF[[paste0(i, "_P.Value")]] <- df_filtered_topFTemp[["P.Value"]]
+    df_filtered_topF[[paste0(i, "_t.stat")]] <- df_filtered_topFTemp[["t"]]
+    df_filtered_topF[[paste0(i, "_Adj_P.Value")]] <- df_filtered_topFTemp[["adj.P.Val"]]
+    df_filtered_topF[[paste0(i, "_Regulation")]] <- results
+    df_filtered_topF[[paste0(i, "_logFC")]] <- df_filtered_topFTemp[["logFC"]]
+    
+    if (!all(design.mat[, which(contrasts[, i] == 1)] %in% c(0, 1, -1, 0.5, -0.5))) {
+      df_filtered_topF[[paste0(i, "_PCC")]] <- apply(logCPM, 1, function(x) { cor(x, design.mat[, which(contrasts[, i] == 1)], use = "complete.obs") })
+    }
+  }
+  
+  lst_contrast$Analysis[[nameOfSubset]][['contrasts']] <- contrasts
+  lst_contrast$Analysis[[nameOfSubset]][["DEG"]] <- list()
+  lst_contrast$Analysis[[nameOfSubset]][["DEG"]][['eset']] <- eset_temp
+  lst_contrast$Analysis[[nameOfSubset]][["DEG"]][['dge']] <- dge
+  lst_contrast$Analysis[[nameOfSubset]][["DEG"]][['design.mat']] <- design.mat
+  lst_contrast$Analysis[[nameOfSubset]][["DEG"]][['fit2']] <- fit2
+  lst_contrast$Analysis[[nameOfSubset]][["DEG"]][['results']] <- results
+  lst_contrast$Analysis[[nameOfSubset]][["DEG"]][['results_full']] <- df_filtered_topF
+  
+  ####### Pathway analysis ##########
+  eset.subset.norm <- eset_temp[rownames(dge), ]
+  exprs(eset.subset.norm) <- cpm(dge, normalized.lib.sizes = T, log = F)[, sampleNames(eset.subset.norm)]
+  
+  fData(eset.subset.norm)$SYMBOL <- fData(eset.subset.norm)$gene_name
+  
+  eset.collapsed <- eset.subset.norm
+  featureNames(eset.collapsed) <- fData(eset.collapsed)$gene_name
+  
+  eset.collapsed.Symbol <- eset.collapsed
+  
+  # Fix the rownames for gsva, must be uppercase
+  rownames(eset.collapsed.Symbol) <- toupper(rownames(eset.collapsed.Symbol))
+  
+  
+  lst_contrast$Analysis[[nameOfSubset]][["GSVA"]] <- list()
+  lst_contrast$Analysis[[nameOfSubset]][["GSVA"]][['eset.collapsed.Symbol']] <- eset.collapsed.Symbol
+  rm(eset.collapsed)
+  
+  # perform IQR filter
+  iqr50 <- quantile(apply(exprs(eset.collapsed.Symbol), 1, IQR), 0.5)
+  
+  filterIQR50 <- function(x)(IQR(x) > iqr50)
+  flist <- filterfun(filterIQR50)
+  filterList <- genefilter::genefilter(expr = exprs(eset.collapsed.Symbol),flist = flist)
+  
+  eset.collapsed.Symbol <- eset.collapsed.Symbol[filterList,]
+  
+  
+  # Step 2perform the GSVA. for each geneSet that has been loaded.
+  for (geneSet in names(lst_geneSets)) {
+    lst_contrast$Analysis[[nameOfSubset]][["GSVA"]][[geneSet]] <- list()
+    
+    eset.gsva <- GSVA::gsva(expr = eset.collapsed.Symbol,
+                            gset.idx.list = lst_geneSets[[geneSet]],
+                            parallel.sz =  1,
+                            kcdf="Poisson",
+                            method = 'gsva',
+                            verbose = FALSE)
+  
+    design.mat.temp <- na.omit(design.mat)
+    eset.gsva.temp  <- eset.gsva[, rownames(design.mat.temp)]
+    fit <- lmFit(eset.gsva.temp, na.omit(design.mat.temp))
+    
+    # Collect the F test results
+    fit2 <- contrasts.fit(fit, contrasts = contrasts)
+    fit2 <- eBayes(fit2)
+    
+    df_filtered_topF <- topTableF(fit2, number = Inf, sort.by = 'none')
+    df_filtered_topF[["Anova P.Value"]] <- df_filtered_topF[["P.Value"]]
+    
+    for (i in colnames(contrasts)) {
+
+      if (!grepl("regression", nameOfSubset)) {
+       fit <- lmFit(eset.gsva, design.mat)
+       fit2 <- contrasts.fit(fit, contrasts = contrasts[, i])
+      } else {
+        design.mat.temp <- design.mat[, c(1, which(contrasts[,i] == 1)), drop = F]
+
+        # Add blocking variables
+        #design.mat.temp <- cbind(design.mat.temp, model.matrix(~ batch)[, -1])
+        design.mat.temp <- na.omit(design.mat.temp)
+        eset.gsva.temp  <- eset.gsva[, rownames(design.mat.temp)]
+        fit <- lmFit(eset.gsva.temp, design.mat.temp)
+        #fit2 <- contrasts.fit(fit, contrasts = c(0,1,0))
+        fit2 <- contrasts.fit(fit, contrasts = c(0,1))
+      }
+
+      fit2 <- eBayes(fit2)
+      
+      df_filtered_topFTemp <- topTable(fit2, number = Inf, sort.by = 'none')
+      #results <- decideTests(fit2, adjust.method = 'none', p.value = 0.05)
+      #results <- as.vector(ifelse(results == 1, "Up", ifelse(results == -1, "Dn", "N.s.")))
+      #results <- as.vector(ifelse(results < 0, "Dn", "Up"))
+      results <- as.vector(decideTests(fit2, adjust.method = 'none', p.value = 0.05))
+    results <- ifelse(results == 1, "Up", ifelse(results == -1, "Dn", "N.s."))
+      
+      df_filtered_topF[[paste0(i, "_P.Value")]] <- df_filtered_topFTemp[["P.Value"]]
+      df_filtered_topF[[paste0(i, "_t.stat")]] <- df_filtered_topFTemp[["t"]]
+      df_filtered_topF[[paste0(i, "_Adj_P.Value")]] <- df_filtered_topFTemp[["adj.P.Val"]]
+      df_filtered_topF[[paste0(i, "_Regulation")]] <- results
+      df_filtered_topF[[paste0(i, "_logFC")]] <- df_filtered_topFTemp[["logFC"]]
+      
+      if (!all(design.mat[, which(contrasts[, i] == 1)] %in% c(0, 1, -1, 0.5, -0.5))) {
+        df_filtered_topF[[paste0(i, "_PCC")]] <- apply(eset.gsva, 1, function(x) { cor(x, design.mat[, which(contrasts[, i] == 1)], use = "complete.obs") })
+      }
+    }
+    
+    lst_contrast$Analysis[[nameOfSubset]][["GSVA"]][[geneSet]] <- list()
+    lst_contrast$Analysis[[nameOfSubset]][["GSVA"]][[geneSet]][['eset.gsva']] <- eset.gsva
+    lst_contrast$Analysis[[nameOfSubset]][["GSVA"]][[geneSet]][['fit2']] <- fit2
+    lst_contrast$Analysis[[nameOfSubset]][["GSVA"]][[geneSet]][['results']] <- results
+    lst_contrast$Analysis[[nameOfSubset]][["GSVA"]][[geneSet]][['results_full']] <- df_filtered_topF
+  }
+  
+  # Cleanup
+  rm(df_filtered_topF)
+}
+
+# Save the Analysis
+currentTime <- paste(format(Sys.time(), "%Y-%m-%dt%H_%M_%S"))
+saveRDS(lst_contrast, file=paste0("save/Preliminary_Analysis_", currentTime,".RDS"))
+```
+
+```{r Session Info, results='markup'}
+
+Hmisc::markupSpecs$html$session()
+
+```

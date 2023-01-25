@@ -1,0 +1,560 @@
+---
+title: "COVID PAXGENE Set1 and Set2"
+author: "Manonmani Kumar"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  rmdformats::html_clean:
+    highlight: kate
+    toc_depth: 1
+    gallery: true
+---
+
+
+```{r knitr_init, echo=FALSE, cache=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="95")
+opts_chunk$set(echo=FALSE,
+               cache=FALSE,
+               prompt=FALSE,
+               tidy=FALSE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE,
+               results='asis',
+               fig.retina = 2,
+               pngquant = '--speed=1 --nofs')
+opts_knit$set(width=95)
+
+## IMG optimization
+knit_hooks$set(pngquant = hook_pngquant)
+```
+
+```{r LoadLibraries}
+# Always Load these libraries (Adjust for the final script)
+# CRAN
+library(assertthat)
+library(tidyverse)
+library(reshape2)
+library(gdata)
+library(ggplot2)
+library(grid)
+library(edgeR)
+library(DT)
+
+# Bioconductor
+library(Biobase)
+library(limma)
+library(impute)
+
+# Optional
+
+library(knitr)
+library(RColorBrewer)
+library(gridExtra)
+library(flashClust)
+library(ggdendro)
+library(ggrepel)
+library(pheatmap)
+
+# Set Random Seed for
+base::set.seed(42) # Because 42 is the answer to everything in a random universe.
+```
+
+```{r write_functions, results='hide'}
+
+plotMultipleDensities <- function(exprs_mat, ncol=3) {
+  # Determine Groups
+  array_sort <- names(sort(rowMeans(t(exprs_mat), na.rm=T), decreasing = T))
+  num_groups <- length(array_sort) %/% 12
+  extra <- length(array_sort) %% 12
+  
+  # Check if there are more columns than needed
+  if (dim(exprs_mat)[2] < ncol*12) {
+    ncol <- num_groups
+    if (extra != 0) ncol <- ncol + 1
+  }
+
+  if (extra == 0) {
+    groups <- data.frame(array_sort, group=rep(1:num_groups, 12))
+  } else {
+    groups <- data.frame(array_sort, group=c(rep(1:(num_groups + 1), extra), if(num_groups != 0) rep(1:num_groups, 12 - extra)))
+    num_groups <- num_groups + 1
+  }
+  
+  # Create plots
+  plots <- lapply(1:num_groups, function(x){
+    exprs_melt <- melt(exprs_mat[,groups[groups$group == x, 1], drop = F], na.rm=T)
+    plot <- ggplot(exprs_melt, aes(value)) + stat_density(adjust = 1, geom = "path", position="identity", na.rm=TRUE, trim=TRUE, aes(color=factor(Var2))) + scale_color_manual(values=brewer.pal(12, "Paired")) + theme(title=element_blank(), axis.title=element_blank())
+    return(plot)
+  })
+  
+  do.call(arrangeGrob, c(plots, ncol=ncol, left="Density", bottom="Values"))
+}
+
+# Based on code from http://michaeljw.com/blog/post/subchunkify/
+
+#' Generate a sub-chunk to be interpreted by knitr.  The enclosing chunk
+#' must have "results='asis'"
+#'
+#' @param g The output to chunkify (only tested with figures to date)
+#' @param ... Additional named arguments to the chunk
+#' @return NULL
+#' @details The chunk is automatically output to the console.  There is
+#'   no need to print/cat its result.
+#' @export
+subchunkify <- local({
+  chunk_count <- 0
+  function(g, ...) {
+    chunk_count <<- chunk_count + 1
+    g_deparsed <-
+      paste0(deparse(
+        function() {g}
+      ),
+      collapse = '')
+    args <- list(...)
+    args <-
+      lapply(names(args),
+             FUN=function(nm, arglist) {
+               current <- arglist[[nm]]
+               if (length(current) > 1) {
+                 stop("Only scalars are supported by subchunkify")
+               } else if (is.character(current) | is.factor(current)) {
+                 current <- as.character(current)
+                 ret <- paste0('"', gsub('"', '\"', current, fixed=TRUE), '"')
+               } else if (is.numeric(current) | is.logical(current)) {
+                 ret <- as.character(current)
+               } else {
+                 stop("Unhandled class in subchunkify argument handling")
+               }
+               paste0(nm, "=", ret)
+             },
+             arglist=args)
+    args <- paste0(unlist(args), collapse=", ")
+    chunk_header <-
+      paste(
+        paste0("{r sub_chunk_", chunk_count),
+        if (nchar(args) > 0) {
+          paste(",", args)
+        } else {
+          NULL
+        },
+        ", echo=FALSE}")
+    
+    sub_chunk <- paste0(
+      "\n```",chunk_header, "\n",
+      "(", 
+      g_deparsed
+      , ")()\n",
+      "```\n")
+    cat(knitr::knit(text = knitr::knit_expand(text = sub_chunk), quiet = TRUE))
+  }
+})
+
+
+```
+
+```{r loadEset, results='hide'}
+
+# Read Eset
+project <- readRDS("eset_raw_2021-03-08t19_59_37.RDS")
+eset_raw <- project$Esets$eset_raw
+
+# Scale eset for visualizations and filter low counts
+exprs_raw_mat <- log2(exprs(eset_raw[rowSums(exprs(eset_raw)) > dim(eset_raw)[2], ]) + 0.25)
+
+# Batch Correct
+#exprs_raw_mat <- limma::removeBatchEffect(exprs_raw_mat, eset_raw$batch) 
+
+```
+
+```{r normalize_eset, results='hide'}
+
+## Use the EdgeR method for this project
+
+dge       <-  DGEList(counts       =   exprs(eset_raw),
+                      remove.zeros =   TRUE)
+dge       <-  calcNormFactors(object = dge, method = "TMM")
+  
+# Temp Norm for qc
+exprs_norm_mat  <- cpm(dge[rowSums(dge$counts) > dim(dge)[2], ], normalized.lib.sizes=TRUE, log = T, prior.count = 0.25)
+#exprs_norm_mat <- voom(exprs(eset_raw), normalize = "quantile")$E
+#exprs_norm_mat <- limma::removeBatchEffect(exprs_norm_mat, eset_raw$batch)
+
+# End of normalization
+```
+
+# Project Summary
+
+Possible confounding covariates
+* Library Prep
+
+
+```{r numbersBreakdown}
+
+table1 <- as.data.frame(table(eset_raw$group))
+colnames(table1) <- c("Group", "Number in group")
+knitr::kable(table1, align = "c")
+
+table1 <- as.data.frame(table(eset_raw$donor.id))
+colnames(table1) <- c("Donor", "Number in group")
+knitr::kable(table1, align = "c")
+
+```
+
+
+```{r trimStats}
+
+# These files are generated during pre-processing and should be included in the data folder along with the phenoData
+
+#trimmingCounts <- read.csv("./data/trimmingCounts.csv", row.names=1, check.names=F)
+#trimmingCounts <- trimmingCounts[, colnames(eset_raw)]
+
+#trimmingStats <- read.csv("./data/trimmingStats.csv", row.names=1, check.names=F)
+#trimmingStats <- trimmingStats[, colnames(eset_raw)]
+
+hisat2Stats <- read.csv("./data/hisat2logs.csv", row.names=1, check.names=F, stringsAsFactors = F)
+colnames(hisat2Stats) <- gsub("_S[0-9][0-9]","", colnames(hisat2Stats))
+colnames(hisat2Stats) <- gsub("_S[0-9]","", colnames(hisat2Stats))
+hisat2Stats <- hisat2Stats[, colnames(eset_raw)]
+
+
+for (i in colnames(hisat2Stats)) {
+  hisat2Stats["Total Aligned", i] <- sum(as.numeric(as.vector(hisat2Stats[c(3:5),i]))) + 
+    sum(as.numeric(as.vector(hisat2Stats[c(6,7),i])))/2 
+}
+
+#trimmingMax <- data.frame(length = as.numeric(rownames(trimmingCounts)), max = apply(trimmingCounts, 1, max))
+
+# Trim Lengths Graph
+#gg <- ggplot(trimmingMax, aes(x=length, y=max)) + geom_line(size=1) + scale_y_log10(breaks = c(1e03, 1e04, 1e05, 1e06, 1e07, 1e08)) +
+#       labs(x="Read Length", y="Number Of Reads", title="Read Length Post Trimming") + scale_x_reverse()
+
+#subchunkify(grid.draw(gg), 
+ #           fig.width = (dim(eset_raw)[2] * 80)/200, 
+#            fig.height = (dim(eset_raw)[2] * 60)/200, 
+#            fig.cap = "Fig. 1: Trimming Statistics")
+
+```
+
+
+```{r readStats}
+
+# Read Stats
+#rowNames <- paste(colnames(trimmingStats), eset_raw$group, eset_raw$donor.id, sep=" | ")
+#index <- colnames(trimmingStats)
+#readStat <- data.frame(index=rowNames,
+#                       "Reads Filtered Out During Trimming"=t(trimmingStats)[index, #"Total read pairs processed"] - t(trimmingStats)[index, "Read pairs available"],
+#                       "Unmapped Reads"=t(trimmingStats)[index, "Read pairs 
+#available"] - as.numeric(t(hisat2Stats)[index, "Total Aligned"]),
+#                       "Mapped but Unknown #Reads"=as.numeric(t(hisat2Stats)[colnames(trimmingStats), "Total Aligned"]) - #colSums(exprs(eset_raw))[colnames(trimmingStats)],
+#                       "Mapped and Counted Reads"=colSums(exprs(eset_raw))[colnames(trimmingStats)], check.names = F)
+
+
+
+
+#readStat <- melt(readStat, id.vars="index")
+
+#gg <- ggplot(data    = readStat,
+#             mapping = aes(x    = index,
+#                           y    = value,
+#                           by   = variable,
+#                           fill = factor(variable, levels=c("Reads Filtered Out #During Trimming","Unmapped Reads","Mapped but Unknown Reads","Mapped and Counted #Reads")))) +
+#             geom_bar(stat = "identity",
+#             		  color="black") +
+#             scale_fill_brewer(palette="Blues", name="Class") +
+#             theme(axis.text.x = element_text(angle=90,
+#             							      size=6),
+#                   axis.line   = element_line(color = "grey"),
+#                   panel.background = element_blank()) +
+#                   scale_y_continuous(expand = c(0, 0)) +
+#             labs(x="Index") + coord_flip() + #theme(axis.text.x=element_text(angle=45, size=9, vjust=0.5))
+
+#subchunkify(grid.draw(gg), 
+#            fig.width = (dim(eset_raw)[2] * 240)/200, 
+#            fig.height = (dim(eset_raw)[2] * 120)/200, 
+#            fig.cap = "Fig. 2: Read Statistics")
+
+```
+
+# Gene Count Distribution Plots 
+
+## {.tabset .tabset-pills}
+
+The box and density plots show the overall distribution of the counted reads which will be used in the analysis.
+
+```{r Box plot}
+
+for (plot.name in c("Raw", "Normalized")) {
+  
+  if (plot.name == "Raw") {
+    cat("\n\n### Raw Data\n\n")
+    exprs_mat <- exprs_raw_mat
+  } else {
+    cat("\n\n### TMM Normalized Data\n\n")
+    exprs_mat <- exprs_norm_mat
+  }
+  
+  df <- exprs_mat
+  colnames(df) <- paste(colnames(df), eset_raw$group, eset_raw$donor.id, sep=" | ")
+  df <- melt(df)
+  df$Var2 <- as.character(df$Var2)
+  
+  gg <- ggplot(df, aes(x = Var2, y = value, alpha=0.2)) +
+    labs(x="Index", 
+         y="Count Intensity", 
+         title=paste("QC Boxplot:", plot.name)) +
+    geom_boxplot(alpha=0.5, aes(color=Var2)) + 
+    coord_flip() +
+    theme(axis.text.x=element_text(angle=90, size=15, vjust=0.5)) +
+    theme(plot.title = element_text(size=20, face="bold", vjust=2)) + 
+    theme(legend.title=element_blank()) +
+    theme(panel.background = element_rect(fill = 'grey75')) +
+    theme(legend.position="none")
+  
+  subchunkify(grid.draw(gg), 
+              fig.width = as.numeric(((dim(eset_raw)[2] + max(nchar(colnames(df)))) * 20)/300), 
+              fig.height = (dim(eset_raw)[2] * 20)/100, 
+              fig.cap = paste("Fig. 3: Box Plot", plot.name))
+}
+
+```
+
+## {.tabset .tabset-pills}
+
+```{r Density Plots}
+
+for (plot.name in c("Raw", "Normalized")) {
+  
+  if (plot.name == "Raw") {
+    cat("\n\n### Raw Data\n\n")
+    exprs_mat <- exprs_raw_mat
+  } else {
+    cat("\n\n### TMM Normalized Data\n\n")
+    exprs_mat <- exprs_norm_mat
+  }
+
+  ncol <- 2
+  
+  gg <- plotMultipleDensities(exprs_mat, ncol=ncol)
+  
+  subchunkify(grid.draw(gg), 
+              fig.width = (ncol * 28 * 80)/600, 
+              fig.height = (ceiling((length(gg$grobs)-2) / ncol) * 28 * 80)/600, 
+              fig.cap = paste("Fig. 4: Density Plots", plot.name))
+  
+}
+
+```
+
+## 
+
+### Potential Over-represented Features
+
+```{r Over Represented Genes}
+
+# Check the proportion for the top 10 abundant features
+prop <- t(apply(exprs(eset_raw)[order(rowMeans(exprs(eset_raw)), decreasing = T)[1:10], ], 1, function(x) x/colSums(exprs(eset_raw))))
+colnames(prop) <- eset_raw$sample.name
+
+# Order by abundance and melt
+prop <- melt(prop[, order(colSums(prop))])
+colnames(prop) <- c("Gene", "Sample", "Proportion")
+
+gg <- ggplot(prop, aes(x = Sample, y = Proportion, color = Gene, group = Gene)) + geom_line(size=1) + theme(axis.text.x=element_text(angle=90, size=9, vjust=0.5)) + scale_y_continuous(labels = scales::percent) + labs(x = "Sample ID", y = "Proportion of Total Counts")
+
+subchunkify(grid.draw(gg), 
+            fig.width = (dim(eset_raw)[2] * 30)/200, 
+            fig.height = (dim(eset_raw)[2] * 30)/200, 
+            fig.cap = "Fig. 5: Read Statistics")
+
+```
+
+# Sample Distance Plots 
+
+## {.tabset .tabset-pills}
+
+Sample dendrogram and multi-dimensional scaling plots show the trends present at the transcriptome level driving the data in an unbiased manner.
+
+```{r Dendrogram}
+
+p.outliers <- list()
+
+for (plot.name in c("Raw", "Normalized")) {
+  
+  # Cluster samples based on count,
+  if (plot.name == "Raw") {
+    cat("\n\n### Raw Data\n\n")
+    sampleTree <- flashClust(dist(t(exprs_raw_mat)), method = "average")
+    #p.outliers[[plot.name]] <- colnames(eset_raw)[which(cutree(sampleTree, 2) == 2)] 
+    #eset_raw$batch <- ifelse(colnames(eset_raw) %in% colnames(eset_raw)[which(cutree(sampleTree, 2) == 2)], "B1", "B2")
+
+  } else {
+    cat("\n\n### TMM Normalized Data\n\n")
+    sampleTree <- flashClust(dist(t(exprs_norm_mat)), method = "average")
+    #sampleTree$labels <- paste(sampleTree$labels, " | ", eset_raw$batch)
+    #p.outliers[[plot.name]] <- colnames(eset_raw)[which(cutree(sampleTree, 2) == 2)] 
+
+  }
+  
+  
+  sampleTree$labels <- paste(sampleTree$labels, eset_raw$group, eset_raw$donor.id, sep = " | ")
+  
+  gg <- ggdendrogram(sampleTree, rotate = T)
+  
+  subchunkify(grid.draw(gg), 
+              fig.width = as.numeric(((dim(eset_raw)[2] + max(nchar(sampleTree$labels))) * 60)/400), 
+              fig.height = (dim(eset_raw)[2] * 60)/400, 
+              fig.cap = paste("Fig. 6: Hierarchical Clustering", plot.name))
+}
+  
+```
+
+## {.tabset .tabset-pills}
+
+```{r MDS}
+
+# Auto-label outliers based on their Eigenvalues
+  
+for (plot.name in c("Raw", "Normalized")) {
+  
+  if (plot.name == "Raw") {
+    cat("\n\n### Raw Data\n\n")
+    exprs_mat <- exprs_raw_mat
+  } else {
+    cat("\n\n### TMM Normalized Data\n\n")
+    exprs_mat <- exprs_norm_mat
+  }
+  
+  mat <- plotMDS(exprs_mat, plot = F)
+  
+  plotDF      <-  data.frame(Dimension1   =   mat$x,
+                             Dimension2   =   mat$y,
+                             Group = eset_raw$group,
+                             Label = eset_raw$donor.id)
+  
+  # Find outliers
+  
+  
+  gg <- ggplot(data    =    plotDF,
+               mapping =    aes(x     =   Dimension1,
+                                y     =   Dimension2,
+                                color =   Group,
+                                label =   Label))+
+    geom_point(size = 5) +
+    labs(title = paste(plot.name, "Multidimensional scaling plot")) + geom_label_repel()
+    #labs(title = paste(plot.name, "Multidimensional scaling plot")) + geom_label_repel(data = subset(plotDF, rownames(plotDF) %in% p.outliers[[plot.name]]), aes(label = Label), show.legend = F)
+    #labs(title = paste(plot.name, "Multidimensional scaling plot")) #+ geom_label_repel(data = subset(plotDF, eset_raw$batch == 'a'), aes(label = Label), show.legend = F)
+  
+  
+  subchunkify(grid.draw(gg), 
+              fig.width = (dim(eset_raw)[2] * 30)/150, 
+              fig.height = (dim(eset_raw)[2] * 10)/100, 
+              fig.cap = paste("Fig. 7: MDS Plot", plot.name))
+}
+
+```
+
+# Unsupervised Heatmaps {.tabset .tabset-pills}
+
+```{r Unsupervised Heatmaps}
+
+for (plot.name in c("Abundance", "Variance")) {
+  
+  mat <- exprs_norm_mat
+  
+  # Set rownames to gene Symbols
+  rownames(mat) <- fData(eset_raw[rownames(mat), ])$gene_id
+
+  # Filter out orfs and Locs
+  #mat <- mat[!grepl("LOC.*|*orf*", rownames(mat)), ]
+  
+  samples <- colnames(mat)
+  
+  if (plot.name == "Abundance") {
+    cat("\n\n## By Abundance\n\n")
+    
+    # Define top 50 genes by abundance
+    topFeatures <-  order(rowMeans(mat), decreasing = TRUE)[1:50]
+  } else {
+    cat("\n\n## By Variance\n\n")
+    
+    # Define top 50 genes by variance
+    topFeatures <-  order(apply(mat, 1, var), decreasing = T)[1:50]
+  }
+  
+  # scale expression and define limits for color gradient on heatmaps
+  topExprs   <-  t(scale(t(mat[topFeatures, ])))
+  
+  # phenotype annotation
+  annotation_col <- data.frame("Group" = eset_raw$group)
+  rownames(annotation_col) = rownames(pData(eset_raw))
+  
+  max <- max(abs(topExprs))
+  min <- min(abs(c(quantile(topExprs, .01), quantile(topExprs, .99))))
+  
+  seq <- c(-max, seq(-min, min,length.out = 99), max)
+  
+  colors <- colorRampPalette(c('#2b83ba', '#abdda4','#ffffbf','#fdae61','#d7191c'))(length(seq))
+  
+  p.plot <- pheatmap(topExprs, scale="none", annotation_col = annotation_col, breaks = seq, colors = colors, main = paste("Top Genes by", plot.name, "Heatmap"), cellwidth = 12, cellheight = 12, labels_col = eset_raw$donor.id, silent = T)
+  
+  subchunkify(grid.draw(p.plot$gtable), 
+              fig.width = sum(convertWidth(p.plot$gtable$widths, "inches", valueOnly = T), 1), 
+              fig.height = sum(convertHeight(p.plot$gtable$heights, "inches", valueOnly = T), 1), 
+              fig.cap = paste("Fig. 8: Unsupervised Heatmap by", plot.name))
+  
+}
+```
+
+```{r buildProject}
+## Build and save Project Tree.
+
+project$Esets$eset_raw  <- eset_raw
+project$Esets$counts_norm   <- exprs_norm_mat
+project$savePath          <- file.path("eset_norm_")
+
+```
+
+```{r saveProjectTree, eval = T}
+
+# Create the parameter values
+currentTime <- paste(format(Sys.time(), "%Y-%m-%dt%H_%M_%S"))
+
+
+# Save the analysis
+project$savePath <- paste0(project$savePath,paste0(currentTime,".RDS"))
+saveRDS(project,file = project$savePath)
+
+   
+rm(currentTime)
+
+```
+
+# Session Information
+
+```{r Session Info, results='markup'}
+
+Hmisc::markupSpecs$html$session()
+
+```
+
+# Reference Tables and Figures {.tabset .tabset-pills}
+
+## Sample Phenodata
+
+```{r pData}
+
+datatable(pData(eset_raw), extensions = c('Buttons', 'FixedColumns', 'Scroller'), options = list(
+  dom = 'Bfrtip',
+  buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+  scrollX = TRUE,
+  fixedColumns = TRUE,
+  deferRender = TRUE,
+  scrollY = 500,
+  scroller = TRUE
+))
+```
+
