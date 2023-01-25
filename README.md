@@ -12,11 +12,11 @@ This repository contains scripts and documentation associated with the analyses 
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
 ## Table of Contents
 
-- [Quality Control using FastQC and MultiQC](#Quality Control using FastQC and MultiQC)
-- [Generate genome index file using STAR](#Generate genome index file using using STAR)
-- [Aligning Reads using STAR](#Aligning Reads using STAR)
-- [Differential Expression Genes analysis](#Differential Expression Genes analysis)
-- [Scripts](#Scripts)
+- Quality Control using FastQC and MultiQC
+- Generate genome index file using STAR
+- Aligning Reads using STAR
+- Differential Expression Genes analysis
+- Scripts
 
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
